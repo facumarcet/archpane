@@ -8,12 +8,14 @@ export type Drawing = {
   height: number
   rows: string[]
   boxes: { id: string; x: number; y: number; w: number; label: string; sub: string; color?: string }[]
+  groups: { name: string; x: number; y: number; w: number; h: number }[]
 }
 
 export const toDrawing = (l: Layout, color: (status?: string) => string | undefined): Drawing => ({
   width: l.width,
   height: l.height,
   rows: l.rows,
+  groups: l.groups,
   boxes: l.boxes.map(b => {
     const c = color(b.node.status)
     // Client props are JSON: a box with no status has no color key at all.
@@ -21,8 +23,9 @@ export const toDrawing = (l: Layout, color: (status?: string) => string | undefi
   }),
 })
 
-// What each cell is: an edge cell, or part of box `i` (its border, label row or sub row).
+// What each cell is: an edge cell, a group border, or part of box `i` (its border, label row or sub row).
 const EDGE = -1
+const GROUP = -2
 const BORDER = 0, LABEL = 1, SUB = 2
 const cellOf = (box: number, part: number) => box * 3 + part
 
@@ -30,6 +33,14 @@ const cellOf = (box: number, part: number) => box * 3 + part
 export function paint(d: Drawing): { chars: string[][]; owner: number[][] } {
   const chars = Array.from({ length: d.height }, (_, y) => [...(d.rows[y] ?? '').padEnd(d.width)])
   const owner = Array.from({ length: d.height }, () => new Array<number>(d.width).fill(EDGE))
+  // `?? []`: after a hot reload the canvas can still hold a drawing made before groups existed.
+  for (const g of d.groups ?? []) {
+    for (let y = g.y; y < g.y + g.h; y++) {
+      for (let x = g.x; x < g.x + g.w; x++) {
+        if (y === g.y || y === g.y + g.h - 1 || x === g.x || x === g.x + g.w - 1) owner[y]![x] = GROUP
+      }
+    }
+  }
   d.boxes.forEach((b, i) => {
     const lines = [
       `╭${'─'.repeat(b.w - 2)}╮`,
@@ -71,6 +82,8 @@ export function draw({ Box, Text }: Pick<ClientElements, 'Box' | 'Text'>, d: Dra
       const text = line.slice(x, to).join('')
       if (who === EDGE) {
         runs.push(<Text dimColor>{text}</Text>)
+      } else if (who === GROUP) {
+        runs.push(<Text color="blue">{text}</Text>)
       } else {
         const b = d.boxes[Math.floor(who / 3)]!
         const scope = `n:${b.id}`

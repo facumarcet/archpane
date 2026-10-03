@@ -2,7 +2,7 @@ import type { On } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
 import { screen, toDrawing } from '../hooks/draw'
-import { BOX_H, layout } from '../hooks/lib'
+import { BOX_H, layout, review } from '../hooks/lib'
 
 const TOOL = 'mcp__archpane__diagram'
 const diagram = {
@@ -50,6 +50,71 @@ test('layout ranks top-down, keeps edges out of boxes, and gives every edge one 
   // Four edges point down; db→api closes a cycle, is laid out reversed and points up.
   expect(all.split('▼').length - 1).toBe(4)
   expect(all.split('▲').length - 1).toBe(1)
+})
+
+test('groups get one border per run of ranks that holds their members, and nothing else', () => {
+  const grouped = {
+    nodes: [
+      { id: 'web', group: 'edge' },
+      { id: 'api', group: 'core' },
+      { id: 'jobs', group: 'core' },
+      { id: 'queue', group: 'infra' },
+      { id: 'worker', group: 'core' },
+      { id: 'db', group: 'infra' },
+      { id: 'cdn', group: 'edge' },
+      { id: 'stray' },
+    ],
+    edges: [
+      { from: 'web', to: 'api' },
+      { from: 'api', to: 'jobs' },
+      { from: 'api', to: 'queue' },
+      { from: 'queue', to: 'worker' },
+      { from: 'jobs', to: 'worker' },
+      { from: 'worker', to: 'db' },
+      { from: 'db', to: 'cdn' },
+      { from: 'api', to: 'stray' },
+    ],
+  }
+  const l = layout(grouped as never)
+  type R = { x: number; y: number; w: number; h: number }
+  const within = (b: R, g: R) => b.x >= g.x && b.x + b.w <= g.x + g.w && b.y >= g.y && b.y + b.h <= g.y + g.h
+  const meets = (a: R, b: R) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
+  for (const b of l.boxes) {
+    const box = { ...b, h: BOX_H }
+    const own = l.groups.filter(g => g.name === b.node.group)
+    if (b.node.group) expect(own.some(g => within(box, g))).toBe(true)
+    for (const g of l.groups) if (g.name !== b.node.group) expect(meets(box, g)).toBe(false)
+  }
+  for (const g of l.groups) for (const h of l.groups) if (g !== h) expect(meets(g, h)).toBe(false)
+  // edge has web at the top and cdn at the bottom, with ranks between: two borders.
+  expect(l.groups.filter(g => g.name === 'edge').length).toBe(2)
+  for (const name of ['edge', 'core', 'infra']) expect(l.rows.join('\n')).toContain(` ${name} `)
+})
+
+test('review says a small diagram fits, and names the fix when one is too wide, skips levels or has lonely groups', () => {
+  expect(review(diagram as never)).toMatch(/fits the pane/)
+  const wide = {
+    nodes: [
+      { id: 'top' },
+      ...Array.from({ length: 8 }, (_, i) => ({ id: `mid${i}`, label: `middle service ${i}`, group: i === 0 ? 'solo' : undefined })),
+      { id: 'a' },
+      { id: 'b' },
+      { id: 'c' },
+    ],
+    edges: [
+      ...Array.from({ length: 8 }, (_, i) => ({ from: 'top', to: `mid${i}` })),
+      { from: 'mid1', to: 'a' },
+      { from: 'a', to: 'b' },
+      { from: 'b', to: 'c' },
+      { from: 'top', to: 'c' },
+      { from: 'top', to: 'b' },
+      { from: 'mid2', to: 'c' },
+    ],
+  }
+  const said = review(wide as never)
+  expect(said).toMatch(/columns wide, past the ~100 a pane shows \(widest level: 8 boxes\)/)
+  expect(said).toMatch(/3 edges skip levels/)
+  expect(said).toMatch(/group border around a single box \(solo\)/)
 })
 
 // What a drawn tree shows, row by row: Text runs joined.

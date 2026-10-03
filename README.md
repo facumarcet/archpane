@@ -4,7 +4,7 @@ A live architecture diagram in a side pane of Claude Code. Claude draws it and e
 
 <!-- screenshot: docs/screenshot.png -->
 
-- **Claude draws real diagrams:** components and the edges between them, laid out top-down, with edges routed at right angles.
+- **Claude draws real diagrams:** components and the edges between them, laid out top-down, with edges routed at right angles and components grouped inside labeled borders.
 - **Edit by talking:** "add a Redis cache in front of the API", "mark the worker as done", "what does the queue feed?"
 - **Build status:** each component can be `planned`, `building`, `done` or `blocked`, shown by color. Claude can update statuses as it builds.
 - **Hover a box** to see its details (kind, group, note, outgoing edges) in a fixed line above the prompt.
@@ -43,12 +43,15 @@ archpane is a Claude Code mod: a plugin made of function hooks.
 | The diagram model, patching, and a layered (Sugiyama-style) layout: cycles reversed, long edges split into waypoints, crossing-reducing ordering sweeps, orthogonal routing in terminal cells | `hooks/lib.ts` |
 | Painting boxes and edges into one character grid, sliced to the visible columns and drawn as rows of text runs | `hooks/draw.tsx` |
 | The `Client` region that draws it, pans on drag, and turns a click on a box into a prompt reference | `hooks/canvas.tsx` |
+| How Claude should author diagrams for a narrow pane: one question per diagram, 5–10 boxes, one direction of flow, stores in notes, groups only for multi-box stages, and how to split a large system into an overview plus `<topic>/<stage>` detail diagrams | `skills/drawing-pane-diagrams/SKILL.md` |
 
 The diagram itself is plain JSON: nodes `{ id, label, kind, group, status, note }` and edges `{ from, to, label }`. Claude reads it back with `get` before answering questions about it, so the diagram, not the chat history, is the source of truth.
 
+After every `set` or `patch` the tool answers with the laid-out size and, when the diagram won't read well in a pane (wider than ~100 columns, more than two edges skipping levels, a group border around a single box), a warning naming the fix. The skill tells Claude to fix those before replying.
+
 ## Limits (for now)
 
-- `group` only shows on hover. No boxes are drawn around groups yet.
+- A group whose members sit on non-consecutive levels is drawn as one border per run of levels, each with the group's name.
 - Crossing reduction is heuristic (barycenter sweeps), so dense graphs can still tangle.
 - Wide diagrams need panning: there's no zoom or compact mode yet.
 - If two sessions edit the same diagram at once, the last write wins.
