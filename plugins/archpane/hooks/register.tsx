@@ -1,0 +1,222 @@
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
+
+import type { Current, Diagram, DiagramNode, Status } from '../types'
+import { draw, toDrawing } from './draw'
+import { applyPatch, check, empty, layout, STATUSES, type Patch } from './lib'
+
+const PANE = 'archpane'
+const TOOL = 'mcp__archpane__diagram'
+const DEFAULT = 'main'
+const current = atom({ plugin: 'archpane', key: 'current' } as const, null)
+
+const COLOR: Record<Status, string> = { planned: 'gray', building: 'yellow', done: 'green', blocked: 'red' }
+
+const node = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', description: 'Stable id, e.g. "order-worker"' },
+    label: { type: 'string', description: 'Shown name; defaults to id' },
+    kind: { type: 'string', description: 'e.g. service, worker, db, queue, cache, external' },
+    group: { type: 'string', description: 'Layer or boundary it belongs to' },
+    status: { type: 'string', enum: STATUSES },
+    note: { type: 'string', description: 'One line shown on hover' },
+  },
+  required: ['id'],
+}
+const edge = {
+  type: 'object',
+  properties: { from: { type: 'string' }, to: { type: 'string' }, label: { type: 'string' } },
+  required: ['from', 'to'],
+}
+
+const DESCRIPTION = `Draws and edits a live architecture/component diagram in the user's side pane. Diagrams persist per repository by name.
+Use it whenever you design, explain or build a system's components, and keep it current as work progresses (status: planned → building → done).
+ops:
+- get: current diagram as JSON. Call before answering questions about the diagram or editing it.
+- set: replace the whole diagram (title, nodes, edges).
+- patch: incremental edit. nodes upsert by id (fields merge), edges upsert by from→to, removeNodes (drops their edges), removeEdges.
+- list: diagram names in this repository. open: switch the pane to a diagram (created empty if new). delete: remove one.
+Edges point from caller to callee / producer to consumer. Keep labels short; ids stable.`
+
+type Input = Patch & { op: string; name?: string; diagram?: Diagram }
+
+// ponytail: $.store is one file per user, keyed here by repo root; last write wins across concurrent sessions.
+const keyOf = async ($: EngineInterface, name: string) => `diagram:${await $.session.root()}:${name}`
+const lastKey = async ($: EngineInterface) => `last:${await $.session.root()}`
+
+async function load($: EngineInterface, name: string): Promise<Current> {
+  const saved = (await $.store.get(await keyOf($, name))) as Diagram | undefined
+  return { name, diagram: saved ?? empty() }
+}
+
+async function show($: EngineInterface, cur: Current) {
+  await update($, current, () => cur)
+  await $.store.set(await keyOf($, cur.name), cur.diagram)
+  await $.store.set(await lastKey($), cur.name)
+  void $.ui.open({ id: PANE, title: `Diagram: ${cur.name}` })
+}
+
+const answer = (value: unknown) => ({ result: typeof value === 'string' ? value : JSON.stringify(value) })
+
+export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    await $.command.register({ name: 'diagram', description: 'Open the architecture diagram pane: /diagram [name]' })
+    await $.tool.register({
+      name: 'diagram',
+      description: DESCRIPTION,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          op: { type: 'string', enum: ['get', 'set', 'patch', 'list', 'open', 'delete'] },
+          name: { type: 'string', description: `Diagram name; defaults to the open one, else "${DEFAULT}"` },
+          title: { type: 'string' },
+          diagram: { type: 'object', properties: { title: { type: 'string' }, nodes: { type: 'array', items: node }, edges: { type: 'array', items: edge } } },
+          nodes: { type: 'array', items: node },
+          removeNodes: { type: 'array', items: { type: 'string' } },
+          edges: { type: 'array', items: edge },
+          removeEdges: { type: 'array', items: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' } } } },
+        },
+        required: ['op'],
+      },
+    })
+    if ((await read($, current)) === null) {
+      const last = (await $.store.get(await lastKey($))) as string | undefined
+      if (last !== undefined) {
+        const cur = await load($, last)
+        await update($, current, () => cur)
+      }
+    }
+
+    return next(e)
+  })
+
+  on('command.run', { command: 'diagram' }, async ($, e) => {
+    const asked = e.args.trim()
+    const cur = await read($, current)
+    const next = asked !== '' && asked !== cur?.name ? await load($, asked) : (cur ?? (await load($, DEFAULT)))
+    await update($, current, () => next)
+    await $.store.set(await lastKey($), next.name)
+    await $.ui.open({ id: PANE, title: `Diagram: ${next.name}` })
+
+    return { text: `Diagram "${next.name}" opened (${next.diagram.nodes.length} components).` }
+  })
+
+  on('tool.call', { tool: TOOL }, async ($, e) => {
+    const input = e as unknown as Input
+    const open = await read($, current)
+    const name = input.name?.trim() || open?.name || DEFAULT
+    const base = name === open?.name ? open : await load($, name)
+
+    switch (input.op) {
+      case 'get':
+        return answer(base)
+      case 'list': {
+        const prefix = await keyOf($, '')
+        const names = (await $.store.keys()).filter(k => k.startsWith(prefix)).map(k => k.slice(prefix.length))
+        return answer({ open: open?.name ?? null, diagrams: names })
+      }
+      case 'open':
+        await show($, base)
+        return answer(`Opened "${name}" (${base.diagram.nodes.length} components).`)
+      case 'delete':
+        await $.store.delete(await keyOf($, name))
+        if (open?.name === name) await update($, current, () => ({ name, diagram: empty() }))
+        return answer(`Deleted "${name}".`)
+      case 'set':
+      case 'patch': {
+        let diagram: Diagram
+        try {
+          diagram =
+            input.op === 'set'
+              ? { title: input.diagram?.title ?? input.title, nodes: input.diagram?.nodes ?? [], edges: input.diagram?.edges ?? [] }
+              : applyPatch(base.diagram, input)
+        } catch {
+          return { deny: 'diagram not changed: nodes, edges, removeNodes and removeEdges must be arrays of the documented shape' }
+        }
+        const problem = check(diagram)
+        if (problem !== undefined) return { deny: `diagram not changed: ${problem}` }
+        await show($, { name, diagram })
+        return answer(`"${name}" now has ${diagram.nodes.length} components and ${diagram.edges.length} edges.`)
+      }
+      default:
+        return { deny: `unknown op "${input.op}"` }
+    }
+  })
+
+  // The hover detail lives in the band above the prompt: it stays put while the pane scrolls.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const cur = await read($, current)
+    const isOpen = (await $.ui.panes()).some(p => p.id === PANE)
+    if (cur === null || cur.diagram.nodes.length === 0 || !isOpen) return next(e)
+
+    const { Box, Text } = $.ui.resolve(e)
+    const detail = (n: DiagramNode) => {
+      const out = cur.diagram.edges.filter(ed => ed.from === n.id).map(ed => (ed.label ? `${ed.to} (${ed.label})` : ed.to))
+      return [n.id, n.kind, n.group && `in ${n.group}`, n.status, n.note, out.length > 0 && `→ ${out.join(', ')}`]
+        .filter(Boolean)
+        .join(' · ')
+    }
+
+    return (
+      <Box flexDirection="column">
+        <Box height={1} width={e.props.bodyColumns}>
+          {cur.diagram.nodes.map(n => (
+            <Box
+              key={`d:${n.id}`}
+              position="absolute"
+              top={0}
+              left={0}
+              display="none"
+              hover={{ scope: `n:${n.id}`, display: 'flex' }}
+            >
+              <Text color="cyan" wrap="truncate">{detail(n)}</Text>
+            </Box>
+          ))}
+        </Box>
+        {await next(e)}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const cur = await read($, current)
+    if (cur === null || cur.diagram.nodes.length === 0) {
+      return (
+        <Box flexDirection="column">
+          <Text bold>{cur?.name ?? DEFAULT}</Text>
+          <Text dimColor>Empty. Ask Claude to draw the architecture, e.g. "diagram the services in this repo".</Text>
+        </Box>
+      )
+    }
+
+    const l = layout(cur.diagram)
+    const cols = e.props.bodyColumns
+    const drawing = toDrawing(l, s => (s === undefined ? undefined : COLOR[s as Status]))
+    const isWide = l.width > cols
+    // Terminal and desktop pan with the pointer through a Client; the rest draw it still.
+    const body =
+      e.surface === 'terminal' || e.surface === 'desktop' ? (
+        (() => {
+          const { Client } = $.ui.resolve(e)
+          return <Client key="canvas" module="./canvas.tsx" props={{ ...drawing, cols }} width={cols} height={l.height} />
+        })()
+      ) : (
+        draw({ Box, Text }, drawing, 0, cols)
+      )
+
+    return (
+      <Box flexDirection="column">
+        <Text bold wrap="truncate">{cur.diagram.title ?? cur.name}</Text>
+        <Text wrap="truncate">
+          {STATUSES.map(s => (
+            <Text color={COLOR[s]}>■ {s}  </Text>
+          ))}
+          <Text dimColor>{isWide ? '· drag sideways to pan · hover for details' : '· hover a box for details'}</Text>
+        </Text>
+        {body}
+      </Box>
+    )
+  })
+}

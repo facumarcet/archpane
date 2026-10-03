@@ -1,0 +1,11 @@
+{
+  "name": "archpane",
+  "version": "0.1.0",
+  "description": "Live architecture diagram in a side pane that Claude draws and edits while you talk",
+  "author": { "name": "facumarcet", "url": "https://github.com/facumarcet" },
+  "homepage": "https://github.com/facumarcet/archpane",
+  "repository": "https://github.com/facumarcet/archpane",
+  "license": "MIT",
+  "keywords": ["diagram", "architecture", "pane", "mod", "visualization"],
+  "types": "./types/index.d.ts"
+}
