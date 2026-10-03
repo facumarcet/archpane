@@ -21,3 +21,15 @@ jobs:
         run: claude plugin validate plugins/archpane
       - name: Test plugin
         run: claude plugin test plugins/archpane
+      # The path a user takes: add the marketplace, install from it, check what landed.
+      - name: Install from the marketplace
+        env:
+          CLAUDE_CONFIG_DIR: ${{ runner.temp }}/claude
+        run: |
+          claude plugin marketplace add "$GITHUB_WORKSPACE"
+          claude plugin install archpane@archpane
+          claude plugin list | grep -q "archpane@archpane"
+          installed=$(find "$CLAUDE_CONFIG_DIR/plugins/cache/archpane/archpane" -mindepth 1 -maxdepth 1 -type d | head -1)
+          claude plugin validate "$installed"
+          test -f "$installed/skills/drawing-pane-diagrams/SKILL.md"
+          test -f "$installed/hooks/canvas.tsx"
