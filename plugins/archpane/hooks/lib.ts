@@ -1,8 +1,8 @@
 import type { Diagram, DiagramEdge, DiagramNode, Status } from '../types'
 
 export const STATUSES: readonly Status[] = ['planned', 'building', 'done', 'blocked']
-const MAX_NODES = 300
-const MAX_EDGES = 1000
+const MAX_NODES = 100
+const MAX_EDGES = 200
 
 export type Patch = {
   title?: string
@@ -19,7 +19,12 @@ const edgeKey = (e: { from: string; to: string }) => `${e.from}\u0000${e.to}`
 /** Upserts nodes (merged by id) and edges (by from→to); removing a node drops its edges. */
 export function applyPatch(d: Diagram, p: Patch): Diagram {
   const nodes = new Map(d.nodes.map(n => [n.id, n]))
-  for (const n of p.nodes ?? []) nodes.set(n.id, { ...nodes.get(n.id), ...n })
+  for (const n of p.nodes ?? []) {
+    // A field patched to "" is cleared.
+    const merged: Record<string, unknown> = { ...nodes.get(n.id), ...n }
+    for (const k of Object.keys(merged)) if (k !== 'id' && merged[k] === '') delete merged[k]
+    nodes.set(n.id, merged as DiagramNode)
+  }
   const gone = new Set(p.removeNodes ?? [])
   for (const id of gone) nodes.delete(id)
 
@@ -78,7 +83,43 @@ export type Placed = { node: DiagramNode; x: number; y: number; w: number; label
 export type GroupRect = { name: string; x: number; y: number; w: number; h: number }
 export type Layout = { width: number; height: number; boxes: Placed[]; groups: GroupRect[]; rows: string[] }
 
-const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
+// Terminal cells: a wide character (CJK, most emoji) takes two, the second held by ''.
+// ponytail: a range table, not full Unicode width; ZWJ sequences and flags can still misalign.
+const WIDE: [number, number][] = [
+  [0x1100, 0x115f], [0x2e80, 0x303e], [0x3041, 0x33ff], [0x3400, 0x4dbf], [0x4e00, 0x9fff],
+  [0xa000, 0xa4cf], [0xac00, 0xd7a3], [0xf900, 0xfaff], [0xfe30, 0xfe4f], [0xff00, 0xff60],
+  [0xffe0, 0xffe6], [0x1f300, 0x1f64f], [0x1f680, 0x1f6ff], [0x1f900, 0x1f9ff], [0x1fa70, 0x1faff],
+  [0x20000, 0x3fffd],
+]
+const isWide = (cp: number) => WIDE.some(([a, b]) => cp >= a && cp <= b)
+const isZero = (cp: number) => cp === 0x200d || (cp >= 0xfe00 && cp <= 0xfe0f) || (cp >= 0x300 && cp <= 0x36f)
+
+/** The cells `s` takes on a terminal, one string per cell; joiners and marks ride the cell before. */
+export function cells(s: string): string[] {
+  const out: string[] = []
+  for (const ch of s) {
+    const cp = ch.codePointAt(0)!
+    if (isZero(cp) && out.length > 0) {
+      const at = out[out.length - 1] === '' ? out.length - 2 : out.length - 1
+      out[at] = out[at]! + ch
+    } else if (isWide(cp)) {
+      out.push(ch, '')
+    } else {
+      out.push(ch)
+    }
+  }
+  return out
+}
+export const textWidth = (s: string) => cells(s).length
+
+/** `s` cut to `n` cells with an ellipsis, never through a character. */
+export function clip(s: string, n: number): string {
+  const c = cells(s)
+  if (c.length <= n) return s
+  const kept = c.slice(0, n - 1)
+  if (kept[kept.length - 1] !== '' && c[kept.length] === '') kept.pop()
+  return `${kept.join('')}…`
+}
 const avg = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length
 
 /** An edge pointed down the ranks: `rev` when it closed a cycle and was turned around. */
@@ -145,6 +186,7 @@ type Seg = { a: number; b: number; edge: DiagramEdge; rev: boolean; first: boole
  * every hop routed orthogonally through the gap below its rank.
  */
 export function layout(d: Diagram): Layout {
+  if (d.nodes.length === 0) return { width: 0, height: 0, boxes: [], groups: [], rows: [] }
   const edges = orient(d)
   const ranks = rank(d, edges)
   const depth = d.nodes.length === 0 ? 0 : Math.max(...ranks.values()) + 1
@@ -154,8 +196,8 @@ export function layout(d: Diagram): Layout {
     // A box that opens into a diagram of its own says so after its label.
     const mark = n.detail ? ' ▸' : ''
     const base = n.label ?? n.id
-    const w = Math.min(MAX_W, Math.max(MIN_W, base.length + mark.length + 4, sub.length + 4))
-    const label = clip(base, w - 4 - mark.length) + mark
+    const w = Math.min(MAX_W, Math.max(MIN_W, textWidth(base) + textWidth(mark) + 4, textWidth(sub) + 4))
+    const label = clip(base, w - 4 - textWidth(mark)) + mark
     return { node: n, group: n.group || undefined, rank: ranks.get(n.id)!, w, label, sub: clip(sub, w - 4) }
   })
   const itemOf = new Map(d.nodes.map((n, i) => [n.id, i]))
@@ -185,15 +227,30 @@ export function layout(d: Diagram): Layout {
   const posOf: number[] = new Array(items.length).fill(0)
   const index = () => layers.forEach(l => l.forEach((it, i) => (posOf[it] = i)))
   const segsBelow: Seg[][] = Array.from({ length: depth }, () => [])
-  for (const s of segs) segsBelow[items[s.a]!.rank]!.push(s)
+  const hopsBelow: number[][] = Array.from({ length: depth }, () => [])
+  segs.forEach((s, k) => {
+    segsBelow[items[s.a]!.rank]!.push(s)
+    hopsBelow[items[s.a]!.rank]!.push(k)
+  })
+  // Crossings between two adjacent ranks are the inversions of their hops' (top, bottom)
+  // positions: sorted by top, count earlier hops ending further right (O(E log E) per gap).
   const crossings = () => {
     let c = 0
     for (const ss of segsBelow) {
-      for (let i = 0; i < ss.length; i++) {
-        for (let j = i + 1; j < ss.length; j++) {
-          const p = ss[i]!, q = ss[j]!
-          if ((posOf[p.a]! - posOf[q.a]!) * (posOf[p.b]! - posOf[q.b]!) < 0) c++
-        }
+      const pairs = ss.map(s => [posOf[s.a]!, posOf[s.b]!] as const).sort((p, q) => p[0] - q[0] || p[1] - q[1])
+      const n = pairs.reduce((m, p) => Math.max(m, p[1]), 0) + 2
+      const tree = new Array<number>(n + 1).fill(0)
+      const add = (i: number) => { for (i++; i <= n; i += i & -i) tree[i]!++ }
+      const upTo = (i: number) => { let t = 0; for (i++; i > 0; i -= i & -i) t += tree[i]!; return t }
+      let seen = 0
+      for (let i = 0; i < pairs.length; ) {
+        let j = i
+        while (j < pairs.length && pairs[j]![0] === pairs[i]![0]) j++
+        // Hops from the same top never cross each other: count the group, then add it.
+        for (let k = i; k < j; k++) c += seen - upTo(pairs[k]![1])
+        for (let k = i; k < j; k++) add(pairs[k]![1])
+        seen += j - i
+        i = j
       }
     }
     return c
@@ -264,7 +321,7 @@ export function layout(d: Diagram): Layout {
   const packed = (ms: number[]) => ms.reduce((a, it, i) => a + items[it]!.w + (i > 0 ? gap(ms[i - 1]!, it) : 0), 0)
   const gw = new Map(names.map(g => {
     const widest = Math.max(0, ...entries.flatMap(es => es.flatMap(e => ('group' in e && e.group === g ? [packed(e.members)] : []))))
-    return [g, Math.max(g.split(RUN)[0]!.length + 6, widest + 2 * G_PAD)]
+    return [g, Math.max(textWidth(g.split(RUN)[0]!) + 6, widest + 2 * G_PAD)]
   }))
   const gx = new Map(names.map(g => [g, 0]))
   const after = (e: Entry, next: Entry | undefined) =>
@@ -317,10 +374,14 @@ export function layout(d: Diagram): Layout {
     placeRank(entries[pass % 2 === 0 ? 0 : depth - 1]!, it => xs[it]!)
     settle()
   }
-  const minX = Math.min(...xs, ...names.map(g => gx.get(g)!))
+  let minX = Infinity
+  for (const x of xs) minX = Math.min(minX, x)
+  for (const g of names) minX = Math.min(minX, gx.get(g)!)
   for (let i = 0; i < xs.length; i++) xs[i] = xs[i]! - minX
   for (const g of names) gx.set(g, gx.get(g)! - minX)
-  const width = Math.max(0, ...items.map((it, i) => xs[i]! + it.w), ...names.map(g => gx.get(g)! + gw.get(g)!))
+  let width = 0
+  items.forEach((it, i) => (width = Math.max(width, xs[i]! + it.w)))
+  for (const g of names) width = Math.max(width, gx.get(g)! + gw.get(g)!)
 
   // Ports: a box spreads its hops across its width, ordered by where the other end is.
   const outPort: number[] = new Array(segs.length).fill(0)
@@ -331,9 +392,15 @@ export function layout(d: Diagram): Layout {
       port[k] = node ? Math.max(xs[it]! + 2, Math.min(xs[it]! + w - 3, xs[it]! + Math.round(((i + 1) * w) / (all.length + 1)))) : xs[it]!
     })
   }
+  const outsOf: number[][] = items.map(() => [])
+  const insOf: number[][] = items.map(() => [])
+  segs.forEach((s, k) => {
+    outsOf[s.a]!.push(k)
+    insOf[s.b]!.push(k)
+  })
   items.forEach((_, it) => {
-    spread(it, segs.flatMap((s, k) => (s.a === it ? [k] : [])), k => cx(segs[k]!.b), outPort)
-    spread(it, segs.flatMap((s, k) => (s.b === it ? [k] : [])), k => cx(segs[k]!.a), inPort)
+    spread(it, outsOf[it]!, k => cx(segs[k]!.b), outPort)
+    spread(it, insOf[it]!, k => cx(segs[k]!.a), inPort)
   })
   // A box's only hop goes straight when the other end's port lands on that box anyway.
   const onBox = (it: number, x: number) => items[it]!.node !== undefined && x >= xs[it]! + 2 && x <= xs[it]! + items[it]!.w - 3
@@ -347,9 +414,9 @@ export function layout(d: Diagram): Layout {
   // or the two would share a vertical. Within that order, tracks pack where runs don't touch.
   const lane: number[] = new Array(segs.length).fill(-1)
   const gapH: number[] = new Array(Math.max(0, depth - 1)).fill(2)
-  segsBelow.forEach((ss, g) => {
+  hopsBelow.forEach((ks, g) => {
     if (g >= depth - 1) return
-    const bent = ss.map(s => segs.indexOf(s)).filter(k => outPort[k] !== inPort[k])
+    const bent = ks.filter(k => outPort[k] !== inPort[k])
     const lo = (k: number) => Math.min(outPort[k]!, inPort[k]!)
     const hi = (k: number) => Math.max(outPort[k]!, inPort[k]!)
     const above = new Map(bent.map(k => [k, bent.filter(o => o !== k && inPort[k] === outPort[o])]))
@@ -433,34 +500,39 @@ export function layout(d: Diagram): Layout {
   // A group's name goes where no edge crosses its top border, else its bottom one, else
   // over the top border's first crossings: a group must say what it is.
   for (const g of groups) {
-    const text = ` ${clip(g.name, g.w - 6)} `
+    const text = cells(` ${clip(g.name, g.w - 6)} `)
     const along = (y: number) =>
       Array.from({ length: g.w - 3 - text.length }, (_, i) => g.x + 2 + i).find(x =>
-        [...text].every((_, i) => mask[y * width + x + i] === 0 && !overlay.has(y * width + x + i)),
+        text.every((_, i) => mask[y * width + x + i] === 0 && !overlay.has(y * width + x + i)),
       )
     const top = along(g.y), bottom = top === undefined ? along(g.y + g.h - 1) : undefined
     const [x, y] = top !== undefined ? [top, g.y] : bottom !== undefined ? [bottom, g.y + g.h - 1] : [g.x + 2, g.y]
-    ;[...text].forEach((c, i) => overlay.set(y * width + x + i, c))
+    text.forEach((c, i) => overlay.set(y * width + x + i, c))
   }
 
   // Labels go on after every line: centered on a bent hop's run where it fits,
   // else beside a vertical, only into free cells. The rest show in the hover detail.
   const free = (y: number, x: number, n: number) =>
     x + n <= width && Array.from({ length: n }, (_, i) => y * width + x + i).every(at => mask[at] === 0 && gmask[at] === 0 && !overlay.has(at))
-  const write = (y: number, x: number, text: string) => [...text].forEach((c, i) => overlay.set(y * width + x + i, c))
+  const write = (y: number, x: number, text: string) => cells(text).forEach((c, i) => overlay.set(y * width + x + i, c))
+  const firstHop = new Map<DiagramEdge, number>()
+  segs.forEach((s, k) => {
+    if (s.first) firstHop.set(s.edge, k)
+  })
   for (const e of d.edges) {
     if (!e.label) continue
     // Only the hop leaving the source: a label further down a long edge lands beside
     // whatever else runs there and reads as theirs.
-    const chain = segs.flatMap((s, k) => (s.edge === e && s.first ? [k] : []))
+    const chain = firstHop.has(e) ? [firstHop.get(e)!] : []
     const tryPlace = () => {
       for (const k of chain) {
         const px = outPort[k]!, qx = inPort[k]!
         const room = Math.abs(qx - px) - 1
-        if (lane[k] !== -1 && room >= e.label!.length + 2) {
-          const x = Math.min(px, qx) + 1 + Math.floor((room - e.label!.length - 2) / 2)
-          const cells = Array.from({ length: e.label!.length + 2 }, (_, i) => laneY(k) * width + x + i)
-          if (cells.every(at => gmask[at] === 0 && !overlay.has(at))) {
+        const lw = textWidth(e.label!)
+        if (lane[k] !== -1 && room >= lw + 2) {
+          const x = Math.min(px, qx) + 1 + Math.floor((room - lw - 2) / 2)
+          const run = Array.from({ length: lw + 2 }, (_, i) => laneY(k) * width + x + i)
+          if (run.every(at => gmask[at] === 0 && !overlay.has(at))) {
             write(laneY(k), x, ` ${e.label} `)
             return
           }
@@ -471,7 +543,7 @@ export function layout(d: Diagram): Layout {
         for (let y = top(k); y < turn; y++) spots.push([y, px + 1])
         for (let y = turn + 1; y < bottom(k); y++) spots.push([y, qx + 1])
         // One free cell past the text, so it never touches another line.
-        const spot = spots.find(([y, x]) => free(y, x, text.length + 1))
+        const spot = spots.find(([y, x]) => free(y, x, textWidth(text) + 1))
         if (spot) {
           write(spot[0], spot[1], text)
           return
