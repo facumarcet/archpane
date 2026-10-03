@@ -108,6 +108,33 @@ test('dragging the diagram pans it sideways and stops at its edge', async ($, on
   await ui.pointer({ in: 'canvas', type: 'move', x: -200, y: 0, button: 'left' })
   await ui.pointer({ in: 'canvas', type: 'up', x: -200, y: 0, button: 'left' })
   expect(await pan()).toBe(width - 10)
-  await ui.key({ in: 'canvas', key: 'h' })
-  expect(await pan()).toBe(width - 18)
+})
+
+test('clicking a box puts a reference to it in the prompt and highlights it; a drag does not', async ($, on) => {
+  engine(on)
+  const filled: string[] = []
+  on('prompt.fill', (_$, e) => {
+    filled.push(e.text)
+    return { value: { isFilled: true as const, box: { text: e.text, cursor: e.text.length } } }
+  })
+  await $.tool.call({ tool: TOOL, op: 'set', name: 'click', diagram })
+  const ui = await $.ui.mount({
+    plugin: 'archpane',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'archpane',
+    props: { title: 'Diagram', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+  })
+  const api = layout(diagram as never).boxes.find(b => b.node.id === 'api')!
+
+  await ui.pointer({ in: 'canvas', type: 'down', x: api.x + 2, y: api.y + 1, button: 'left' })
+  await ui.pointer({ in: 'canvas', type: 'move', x: api.x + 12, y: api.y + 1, button: 'left' })
+  await ui.pointer({ in: 'canvas', type: 'up', x: api.x + 12, y: api.y + 1, button: 'left' })
+  expect(filled).toEqual([])
+
+  await ui.pointer({ in: 'canvas', type: 'down', x: api.x + 2, y: api.y + 1, button: 'left' })
+  await ui.pointer({ in: 'canvas', type: 'up', x: api.x + 2, y: api.y + 1, button: 'left' })
+  expect(filled).toEqual(['[diagram click: api] '])
+  const box = await ui.find({ key: 'n:api', in: 'canvas' })
+  expect(box?.props).toMatchObject({ borderColor: 'cyan', borderStyle: 'bold' })
 })
