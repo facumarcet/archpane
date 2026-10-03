@@ -9,7 +9,9 @@ A live architecture diagram in a side pane of Claude Code. Claude draws it and e
 - **Build status:** each component can be `planned`, `building`, `done` or `blocked`, shown by color. Claude can update statuses as it builds.
 - **Hover a box** to see its details (kind, group, note, outgoing edges) in a fixed line above the prompt.
 - **Drag sideways** to pan wide diagrams. The mouse wheel scrolls vertically.
-- **Click a box** to put a reference to it (`[diagram <name>: <id>]`) in your prompt, then ask about it.
+- **Subdiagrams:** a box marked ▸ opens a diagram of what happens inside it when you click it. A breadcrumb at the top leads back. Large systems become an overview plus detail diagrams this way.
+- **Click a box without ▸** to put a reference to it (`[diagram <name>: <id>]`) in your prompt, then ask about it.
+- **Right-click a box** for a menu: ask about it, open its detail, or copy its id.
 - **Saved across sessions,** per repository and per diagram name.
 - **Works in any terminal.** It's drawn with text and box-drawing characters, not images. It also works in the desktop app's Code tab. VS Code and mobile get a static drawing.
 
@@ -42,10 +44,10 @@ archpane is a Claude Code mod: a plugin made of function hooks.
 | The `diagram` tool Claude calls (`get`, `set`, `patch`, `list`, `open`, `delete`), input checks, saving in the plugin store | `hooks/register.tsx` |
 | The diagram model, patching, and a layered (Sugiyama-style) layout: cycles reversed, long edges split into waypoints, crossing-reducing ordering sweeps, orthogonal routing in terminal cells | `hooks/lib.ts` |
 | Painting boxes and edges into one character grid, sliced to the visible columns and drawn as rows of text runs | `hooks/draw.tsx` |
-| The `Client` region that draws it, pans on drag, and turns a click on a box into a prompt reference | `hooks/canvas.tsx` |
+| The `Client` region that draws it, pans on drag, opens a box's subdiagram or asks about it on click, and shows a right-click menu | `hooks/canvas.tsx` |
 | How Claude should author diagrams for a narrow pane: one question per diagram, 5–10 boxes, one direction of flow, stores in notes, groups only for multi-box stages, and how to split a large system into an overview plus `<topic>/<stage>` detail diagrams | `skills/drawing-pane-diagrams/SKILL.md` |
 
-The diagram itself is plain JSON: nodes `{ id, label, kind, group, status, note }` and edges `{ from, to, label }`. Claude reads it back with `get` before answering questions about it, so the diagram, not the chat history, is the source of truth.
+The diagram itself is plain JSON: nodes `{ id, label, kind, group, status, note, detail }` and edges `{ from, to, label }`. Claude reads it back with `get` before answering questions about it, so the diagram, not the chat history, is the source of truth.
 
 After every `set` or `patch` the tool answers with the laid-out size and, when the diagram won't read well in a pane (wider than ~100 columns, more than two edges skipping levels, a group border around a single box), a warning naming the fix. The skill tells Claude to fix those before replying.
 

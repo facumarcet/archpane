@@ -7,6 +7,8 @@ export type DiagramNode = {
   group?: string
   status?: Status
   note?: string
+  /** Name of the diagram showing what happens inside this box. */
+  detail?: string
 }
 
 export type DiagramEdge = { from: string; to: string; label?: string }
@@ -17,6 +19,6 @@ export type Current = { name: string; diagram: Diagram }
 
 declare module 'claude-code' {
   interface PluginState {
-    archpane: { current: Current | null }
+    archpane: { current: Current | null; trail: string[] }
   }
 }

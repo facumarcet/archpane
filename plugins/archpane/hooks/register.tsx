@@ -9,6 +9,8 @@ const PANE = 'archpane'
 const TOOL = 'mcp__archpane__diagram'
 const DEFAULT = 'main'
 const current = atom({ plugin: 'archpane', key: 'current' } as const, null)
+// The diagrams above the open one, outermost first: what the breadcrumb leads back to.
+const trail = atom({ plugin: 'archpane', key: 'trail' } as const, [])
 
 const COLOR: Record<Status, string> = { planned: 'gray', building: 'yellow', done: 'green', blocked: 'red' }
 
@@ -21,6 +23,7 @@ const node = {
     group: { type: 'string', description: 'Layer or boundary it belongs to; members are drawn inside a labeled border' },
     status: { type: 'string', enum: STATUSES },
     note: { type: 'string', description: 'One line shown on hover' },
+    detail: { type: 'string', description: 'Name of a diagram showing what happens inside this box (e.g. "checkout/payment"); the box is marked ▸ and clicking it opens that diagram' },
   },
   required: ['id'],
 }
@@ -38,7 +41,8 @@ ops:
 - patch: incremental edit. nodes upsert by id (fields merge), edges upsert by from→to, removeNodes (drops their edges), removeEdges.
 - list: diagram names in this repository. open: switch the pane to a diagram (created empty if new). delete: remove one.
 Edges point from caller to callee / producer to consumer. Keep labels short; ids stable.
-The user can click a box to put [diagram <name>: <id>] in their prompt: that names a component, look it up with get.`
+A node's detail names a subdiagram of what happens inside it: clicking the box opens it, and a breadcrumb leads back. Draw each detail diagram you link.
+The user can click a box (or pick "Ask about this" from its right-click menu) to put [diagram <name>: <id>] in their prompt: that names a component, look it up with get.`
 
 type Input = Patch & { op: string; name?: string; diagram?: Diagram }
 
@@ -51,7 +55,9 @@ async function load($: EngineInterface, name: string): Promise<Current> {
   return { name, diagram: saved ?? empty() }
 }
 
-async function show($: EngineInterface, cur: Current) {
+/** Puts `cur` in the pane. `above` is the breadcrumb to it: none unless drilling down or back. */
+async function show($: EngineInterface, cur: Current, above: string[] = []) {
+  await update($, trail, () => above)
   await update($, current, () => cur)
   await $.store.set(await keyOf($, cur.name), cur.diagram)
   await $.store.set(await lastKey($), cur.name)
@@ -96,6 +102,7 @@ export const register: Register = on => {
     const asked = e.args.trim()
     const cur = await read($, current)
     const next = asked !== '' && asked !== cur?.name ? await load($, asked) : (cur ?? (await load($, DEFAULT)))
+    await update($, trail, () => [])
     await update($, current, () => next)
     await $.store.set(await lastKey($), next.name)
     await $.ui.open({ id: PANE, title: `Diagram: ${next.name}` })
@@ -138,7 +145,12 @@ export const register: Register = on => {
         const problem = check(diagram)
         if (problem !== undefined) return { deny: `diagram not changed: ${problem}` }
         await show($, { name, diagram })
-        return answer(`"${name}" now has ${diagram.nodes.length} components and ${diagram.edges.length} edges. ${review(diagram)}`)
+        const linked = [...new Set(diagram.nodes.flatMap(n => (n.detail ? [n.detail] : [])))]
+        const prefix = await keyOf($, '')
+        const drawn = new Set((await $.store.keys()).filter(k => k.startsWith(prefix)).map(k => k.slice(prefix.length)))
+        const missing = linked.filter(l => !drawn.has(l))
+        const todo = missing.length > 0 ? ` Detail diagrams linked but not drawn yet: ${missing.join(', ')}.` : ''
+        return answer(`"${name}" now has ${diagram.nodes.length} components and ${diagram.edges.length} edges. ${review(diagram)}${todo}`)
       }
       default:
         return { deny: `unknown op "${input.op}"` }
@@ -180,22 +192,35 @@ export const register: Register = on => {
     )
   })
 
-  // A click on a box in the canvas: reference that component in the prompt.
+  // What the canvas asks for, for a box of the open diagram: data from client code, checked here.
   on('ui.message', { requestId: PANE }, async ($, e) => {
-    const pick = (e.data as { pick?: unknown } | null)?.pick
+    const data = (e.data ?? {}) as { pick?: unknown; open?: unknown; copy?: unknown }
     const cur = await read($, current)
-    const node = cur?.diagram.nodes.find(n => n.id === pick)
-    if (cur && node) {
+    const node = cur?.diagram.nodes.find(n => n.id === (data.pick ?? data.open ?? data.copy))
+    if (!cur || !node) return {}
+
+    if (data.pick !== undefined) {
       const ref = `[diagram ${cur.name}: ${node.id}]`
       await $.prompt.fill({ text: `${ref} `, mode: 'insert', decorations: [{ start: 0, end: ref.length, color: 'cyan' }] })
+    } else if (data.open !== undefined && node.detail) {
+      const child = await load($, node.detail)
+      if (child.diagram.nodes.length === 0) {
+        $.ui.toast(`"${node.detail}" isn't drawn yet: ask Claude to draw it`)
+      } else {
+        await show($, child, [...(await read($, trail)), cur.name])
+      }
+    } else if (data.copy !== undefined) {
+      await $.ui.copy({ text: node.id, surface: e.surface })
+      $.ui.toast(`Copied ${node.id}`)
     }
 
     return {}
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
     const cur = await read($, current)
+    const above = await read($, trail)
     if (cur === null || cur.diagram.nodes.length === 0) {
       return (
         <Box flexDirection="column">
@@ -214,20 +239,34 @@ export const register: Register = on => {
       e.surface === 'terminal' || e.surface === 'desktop' ? (
         (() => {
           const { Client } = $.ui.resolve(e)
-          return <Client key="canvas" module="./canvas.tsx" props={{ ...drawing, cols }} width={cols} height={l.height} />
+          return <Client key="canvas" module="./canvas.tsx" props={{ ...drawing, cols, name: cur.name }} width={cols} height={l.height} />
         })()
       ) : (
         draw({ Box, Text }, drawing, 0, cols)
       )
 
+    // Back up the breadcrumb: crumb `i` becomes the open diagram, what was above it stays above.
+    const back = async (i: number) => show($, await load($, above[i]!), above.slice(0, i))
+
     return (
       <Box flexDirection="column">
+        {above.length > 0 && (
+          <Box flexDirection="row">
+            {above.map((name, i) => (
+              <Box flexDirection="row">
+                <Button key={`crumb:${i}`} plain label={name} onPress={() => back(i)} />
+                <Text dimColor> › </Text>
+              </Box>
+            ))}
+            <Text bold>{cur.name}</Text>
+          </Box>
+        )}
         <Text bold wrap="truncate">{cur.diagram.title ?? cur.name}</Text>
         <Text wrap="truncate">
           {STATUSES.map(s => (
             <Text color={COLOR[s]}>■ {s}  </Text>
           ))}
-          <Text dimColor>{isWide ? '· click a box to ask · drag to pan' : '· click a box to ask about it'}</Text>
+          <Text dimColor>{`· click to ask or open ▸ · right-click for more${isWide ? ' · drag to pan' : ''}`}</Text>
         </Text>
         {body}
       </Box>
