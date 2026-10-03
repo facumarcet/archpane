@@ -40,8 +40,8 @@ archpane is a Claude Code mod: a plugin made of function hooks.
 | Piece | File |
 | --- | --- |
 | The `diagram` tool Claude calls (`get`, `set`, `patch`, `list`, `open`, `delete`), input checks, saving in the plugin store | `hooks/register.tsx` |
-| The diagram model, patching, and the layout (ranks, ordering, orthogonal edge routing in terminal cells) | `hooks/lib.ts` |
-| Drawing a laid-out diagram as boxes and edge rows in the normal flow | `hooks/draw.tsx` |
+| The diagram model, patching, and a layered (Sugiyama-style) layout: cycles reversed, long edges split into waypoints, crossing-reducing ordering sweeps, orthogonal routing in terminal cells | `hooks/lib.ts` |
+| Painting boxes and edges into one character grid, sliced to the visible columns and drawn as rows of text runs | `hooks/draw.tsx` |
 | The `Client` region that draws it, pans on drag, and turns a click on a box into a prompt reference | `hooks/canvas.tsx` |
 
 The diagram itself is plain JSON: nodes `{ id, label, kind, group, status, note }` and edges `{ from, to, label }`. Claude reads it back with `get` before answering questions about it, so the diagram, not the chat history, is the source of truth.
@@ -49,7 +49,8 @@ The diagram itself is plain JSON: nodes `{ id, label, kind, group, status, note 
 ## Limits (for now)
 
 - `group` only shows on hover. No boxes are drawn around groups yet.
-- Ordering within a rank uses a single pass, with no crossing minimization.
+- Crossing reduction is heuristic (barycenter sweeps), so dense graphs can still tangle.
+- Wide diagrams need panning: there's no zoom or compact mode yet.
 - If two sessions edit the same diagram at once, the last write wins.
 - Diagrams live in your Claude Code config, not in the repo, so they can't be shared with teammates yet.
 

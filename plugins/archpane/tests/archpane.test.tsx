@@ -1,7 +1,8 @@
 import type { On } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
-import { layout } from '../hooks/lib'
+import { screen, toDrawing } from '../hooks/draw'
+import { BOX_H, layout } from '../hooks/lib'
 
 const TOOL = 'mcp__archpane__diagram'
 const diagram = {
@@ -38,17 +39,24 @@ const engine = (on: On) => {
   on('ui.open', () => ({ value: { isPlaced: true as const } }))
 }
 
-test('layout ranks top-down, keeps boxes apart and routes skip/back edges in a channel', () => {
+test('layout ranks top-down, keeps edges out of boxes, and gives every edge one arrowhead', () => {
   const l = layout(diagram as never)
   const y = (id: string) => l.boxes.find(b => b.node.id === id)!.y
   expect(y('api') < y('queue') && y('queue') < y('worker') && y('worker') < y('db')).toBe(true)
-  for (const a of l.boxes) for (const b of l.boxes) {
-    if (a !== b) expect(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + 4 <= b.y || b.y + 4 <= a.y).toBe(true)
+  for (const b of l.boxes) {
+    for (let r = b.y; r < b.y + BOX_H; r++) expect((l.rows[r] ?? '').slice(b.x, b.x + b.w).trim()).toBe('')
   }
-  const mainW = Math.max(...l.boxes.map(b => b.x + b.w))
-  expect(l.width > mainW).toBe(true)
-  expect(l.rows.join('\n').split('▼').length - 1).toBe(4)
+  const all = l.rows.join('\n')
+  // Four edges point down; db→api closes a cycle, is laid out reversed and points up.
+  expect(all.split('▼').length - 1).toBe(4)
+  expect(all.split('▲').length - 1).toBe(1)
 })
+
+// What a drawn tree shows, row by row: Text runs joined.
+type El = string | { children?: El[] }
+const textOf = (el: El): string => (typeof el === 'string' ? el : (el.children ?? []).map(textOf).join(''))
+const shown = async (ui: { drawn: (s: { in: string }) => Promise<unknown> }) =>
+  ((await ui.drawn({ in: 'canvas' })) as { children: El[] }).children.map(r => textOf(r).trimEnd())
 
 test('patch rejects an edge to an unknown node and leaves the diagram alone', async ($, on) => {
   engine(on)
@@ -82,13 +90,13 @@ for (const surface of ['terminal', 'desktop'] as const) {
       props: { title: 'Diagram', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
     })
     for (const text of ['Orders API', 'worker', 'queue', 'db']) expect(await ui.find({ type: 'Text', text, in: 'canvas' })).toBeDefined()
-    expect(await ui.find({ key: 'n:api', in: 'canvas' })).toBeDefined()
   })
 }
 
-test('dragging the diagram pans it sideways and stops at its edge', async ($, on) => {
+test('dragging the diagram pans it sideways, showing exactly that slice, and stops at its edge', async ($, on) => {
   engine(on)
   await $.tool.call({ tool: TOOL, op: 'set', name: 'pan', diagram })
+  const full = screen(toDrawing(layout(diagram as never), () => undefined))
   const width = layout(diagram as never).width
   const ui = await $.ui.mount({
     plugin: 'archpane',
@@ -97,17 +105,20 @@ test('dragging the diagram pans it sideways and stops at its edge', async ($, on
     requestId: 'archpane',
     props: { title: 'Diagram', isFocused: true, bodyColumns: 10, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
   })
-  const pan = async () => {
-    const root = (await ui.drawn({ in: 'canvas' })) as unknown as { children: { props: { marginLeft: number } }[] }
-    return Math.abs(root.children[0]!.props.marginLeft)
-  }
-  expect(await pan()).toBe(0)
+  const window = (pan: number) => full.map(r => r.padEnd(width).slice(pan, pan + 10).trimEnd())
+  const api = layout(diagram as never).boxes.find(b => b.node.id === 'api')!
+  const start = Math.max(0, Math.min(width - 10, Math.round(api.x + api.w / 2 - 5)))
+
+  // It opens centered on the top rank (api alone here), not at column 0.
+  expect(await shown(ui)).toEqual(window(start))
   await ui.pointer({ in: 'canvas', type: 'down', x: 8, y: 0, button: 'left' })
   await ui.pointer({ in: 'canvas', type: 'move', x: 3, y: 0, button: 'left' })
-  expect(await pan()).toBe(5)
+  expect(await shown(ui)).toEqual(window(Math.min(width - 10, start + 5)))
+  await ui.pointer({ in: 'canvas', type: 'move', x: 200, y: 0, button: 'left' })
+  expect(await shown(ui)).toEqual(window(0))
   await ui.pointer({ in: 'canvas', type: 'move', x: -200, y: 0, button: 'left' })
   await ui.pointer({ in: 'canvas', type: 'up', x: -200, y: 0, button: 'left' })
-  expect(await pan()).toBe(width - 10)
+  expect(await shown(ui)).toEqual(window(width - 10))
 })
 
 test('clicking a box puts a reference to it in the prompt and highlights it; a drag does not', async ($, on) => {
@@ -115,7 +126,7 @@ test('clicking a box puts a reference to it in the prompt and highlights it; a d
   const filled: string[] = []
   on('prompt.fill', (_$, e) => {
     filled.push(e.text)
-    return { value: { isFilled: true as const, box: { text: e.text, cursor: e.text.length } } }
+    return { isFilled: true as const, box: { text: e.text, cursor: e.text.length } }
   })
   await $.tool.call({ tool: TOOL, op: 'set', name: 'click', diagram })
   const ui = await $.ui.mount({
@@ -135,6 +146,7 @@ test('clicking a box puts a reference to it in the prompt and highlights it; a d
   await ui.pointer({ in: 'canvas', type: 'down', x: api.x + 2, y: api.y + 1, button: 'left' })
   await ui.pointer({ in: 'canvas', type: 'up', x: api.x + 2, y: api.y + 1, button: 'left' })
   expect(filled).toEqual(['[diagram click: api] '])
-  const box = await ui.find({ key: 'n:api', in: 'canvas' })
-  expect(box?.props).toMatchObject({ borderColor: 'cyan', borderStyle: 'bold' })
+  const cyan = (await ui.findAll({ type: 'Text', in: 'canvas' })).filter(t => (t.props as { color?: string }).color === 'cyan')
+  expect(cyan.map(t => t.text)).toContain(`╭${'─'.repeat(api.w - 2)}╮`)
+  expect(cyan.every(t => /^[╭╮╰╯─│]+$/.test(t.text))).toBe(true)
 })

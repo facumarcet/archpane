@@ -15,7 +15,10 @@ const Canvas: ClientModule<Drawing & { cols: number }, Pan> = (d, s) => {
   const view = s.columns || d.cols
   const max = Math.max(0, d.width - view)
   const clamp = (x: number) => Math.max(0, Math.min(max, x))
-  const now = (): Pan => s.state ?? { panX: 0 }
+  // Until the person pans, the window opens centered on the top rank: where the diagram starts.
+  const top = d.boxes.filter(b => b.y === 0)
+  const start = top.length === 0 ? 0 : (Math.min(...top.map(b => b.x)) + Math.max(...top.map(b => b.x + b.w))) / 2
+  const now = (): Pan => s.state ?? { panX: clamp(Math.round(start - view / 2)) }
   const hit = (x: number, y: number, pan: number) =>
     d.boxes.find(b => y >= b.y && y < b.y + BOX_H && x + pan >= b.x && x + pan < b.x + b.w)
 
