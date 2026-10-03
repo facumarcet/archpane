@@ -2,7 +2,7 @@ import type { On } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
 import { screen, toDrawing } from '../hooks/draw'
-import { BOX_H, layout, review } from '../hooks/lib'
+import { BOX_H, layout, review, textWidth } from '../hooks/lib'
 
 const TOOL = 'mcp__archpane__diagram'
 const diagram = {
@@ -289,4 +289,103 @@ test('right-clicking a box shows its menu; its items ask about it or copy its id
   await rightClick()
   await choose('Copy id')
   expect(copied).toEqual(['api'])
+})
+
+// ---- regressions from the pre-release review ------------------------------------
+
+test('an empty diagram saves and reviews without throwing; set takes top-level nodes too', async ($, on) => {
+  engine(on)
+  const none = await $.tool.call({ tool: TOOL, op: 'set', name: 'e', diagram: { nodes: [], edges: [] } })
+  expect(String(none.result)).toMatch(/0 components and 0 edges\. Laid out 0×0: fits the pane\./)
+  const flat = await $.tool.call({ tool: TOOL, op: 'set', name: 'e', nodes: [{ id: 'a' }, { id: 'b' }], edges: [{ from: 'a', to: 'b' }] })
+  expect(String(flat.result)).toMatch(/2 components and 1 edge\./)
+})
+
+test('a patched "" clears a field; /diagram list names the project diagrams', async ($, on) => {
+  engine(on)
+  await $.tool.call({ tool: TOOL, op: 'set', name: 'z', diagram: { nodes: [{ id: 'a', status: 'done', note: 'n' }], edges: [] } })
+  await $.tool.call({ tool: TOOL, op: 'patch', name: 'z', nodes: [{ id: 'a', status: '' }] })
+  const got = JSON.parse(String((await $.tool.call({ tool: TOOL, op: 'get', name: 'z' })).result))
+  expect(got.diagram.nodes[0]).toEqual({ id: 'a', note: 'n' })
+  await $.tool.call({ tool: TOOL, op: 'set', name: 'y', diagram: { nodes: [{ id: 'b' }], edges: [] } })
+  const listed = await $.command.run({ command: 'diagram', args: 'list' })
+  expect(listed.text).toBe('Diagrams in this project:\n  y\n  z')
+})
+
+test('the worst diagram the caps allow lays out fast; one too large to draw is refused with the fix', async ($, on) => {
+  engine(on)
+  const nodes = Array.from({ length: 100 }, (_, i) => ({ id: `n${i}` }))
+  const edges: { from: string; to: string }[] = nodes.slice(1).map((x, i) => ({ from: `n${i}`, to: x.id }))
+  for (let i = 0; edges.length < 200; i++) edges.push({ from: `n${(i * 7) % 50}`, to: `n${50 + ((i * 13) % 50)}` })
+  const t = Date.now()
+  layout({ nodes, edges } as never)
+  expect(Date.now() - t < 1000).toBe(true)
+  const refused = await $.tool.call({ tool: TOOL, op: 'set', name: 'big', diagram: { nodes, edges } })
+  expect(refused.deny).toMatch(/too large to draw in the pane\. Split it into an overview and detail diagrams/)
+})
+
+test('wide characters take two cells: labels never split one, and box borders stay aligned', () => {
+  const d = { nodes: [{ id: 'r', label: '🚀 rocket service 🚀🚀🚀🚀' }, { id: 'k', label: '注文サービス' }], edges: [{ from: 'r', to: 'k' }] }
+  const l = layout(d as never)
+  for (const b of l.boxes) expect(b.label.includes('\ud83d…')).toBe(false)
+  const lines = screen(toDrawing(l, () => undefined))
+  for (const b of l.boxes) {
+    for (let y = b.y; y < b.y + BOX_H; y++) expect(textWidth(lines[y]!.trimEnd()) >= b.x + b.w).toBe(true)
+    const label = lines[b.y + 1]!
+    expect(textWidth(label.slice(0, label.lastIndexOf('│') + 1))).toBe(b.x + b.w)
+  }
+})
+
+test('the right-click menu shows whole on a one-box diagram', async ($, on) => {
+  engine(on)
+  await $.tool.call({ tool: TOOL, op: 'set', name: 'one', diagram: { nodes: [{ id: 'solo' }], edges: [] } })
+  const ui = await $.ui.mount({ plugin: 'archpane', surface: 'terminal', component: 'Pane', requestId: 'archpane', props: PANE_PROPS })
+  const b = layout({ nodes: [{ id: 'solo' }], edges: [] } as never).boxes[0]!
+  await ui.pointer({ in: 'canvas', type: 'down', x: b.x + 2, y: b.y + 1, button: 'right' })
+  await ui.pointer({ in: 'canvas', type: 'up', x: b.x + 2, y: b.y + 1, button: 'right' })
+  const all = (await shown(ui)).join('\n')
+  expect(all).toContain('│ Ask about this │')
+  expect(all).toContain('│ Copy id        │')
+  expect(all).toMatch(/╰─{16}╯/)
+})
+
+test('a detail cycle does not grow the breadcrumb; deleting a diagram drops its crumb and keeps it deleted', async ($, on) => {
+  engine(on)
+  await $.tool.call({ tool: TOOL, op: 'set', name: 'loop/b', diagram: { nodes: [{ id: 'back', detail: 'loop' }], edges: [] } })
+  await $.tool.call({ tool: TOOL, op: 'set', name: 'loop', diagram: { nodes: [{ id: 'down', detail: 'loop/b' }], edges: [] } })
+  const ui = await $.ui.mount({ plugin: 'archpane', surface: 'terminal', component: 'Pane', requestId: 'archpane', props: PANE_PROPS })
+  const click = async () => {
+    const b = (await shown(ui)).findIndex(l => l.includes('▸'))
+    const x = (await shown(ui))[b]!.indexOf('▸')
+    await ui.pointer({ in: 'canvas', type: 'down', x, y: b, button: 'left' })
+    await ui.pointer({ in: 'canvas', type: 'up', x, y: b, button: 'left' })
+  }
+  await click()
+  await click()
+  await click()
+  // loop → loop/b → loop → loop/b: still one crumb, not three.
+  expect(await ui.find({ type: 'Button', key: 'crumb:0' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'crumb:1' })).toBeUndefined()
+
+  await $.tool.call({ tool: TOOL, op: 'delete', name: 'loop' })
+  expect(await ui.find({ type: 'Button', key: 'crumb:0' })).toBeUndefined()
+  const list = JSON.parse(String((await $.tool.call({ tool: TOOL, op: 'list' })).result))
+  expect(list.diagrams).not.toContain('loop')
+})
+
+test('the canvas opens centered on the top rank even when a group border pushes it down', async ($, on) => {
+  engine(on)
+  const d = {
+    nodes: [{ id: 'a', group: 'g' }, { id: 'b', group: 'g' }, { id: 'c', label: 'a very long label here' }, { id: 'e', label: 'another long label' }, { id: 'f', label: 'and one more' }],
+    edges: [{ from: 'a', to: 'c' }, { from: 'b', to: 'e' }, { from: 'b', to: 'f' }],
+  }
+  await $.tool.call({ tool: TOOL, op: 'set', name: 'g', diagram: d })
+  const l = layout(d as never)
+  const top = l.boxes.filter(b => b.y === Math.min(...l.boxes.map(x => x.y)))
+  expect(top[0]!.y > 0).toBe(true)
+  const ui = await $.ui.mount({ plugin: 'archpane', surface: 'terminal', component: 'Pane', requestId: 'archpane', props: { ...PANE_PROPS, bodyColumns: 20 } })
+  const mid = (Math.min(...top.map(b => b.x)) + Math.max(...top.map(b => b.x + b.w))) / 2
+  const start = Math.max(0, Math.min(l.width - 20, Math.round(mid - 10)))
+  const full = screen(toDrawing(l, () => undefined))
+  expect(await shown(ui)).toEqual(full.map(r => r.padEnd(l.width).slice(start, start + 20).trimEnd()).concat(Array(Math.max(0, 10 - l.height)).fill('')))
 })

@@ -26,13 +26,15 @@ const LABELS: Record<Action, string> = { pick: 'Ask about this', open: 'Open det
  *   an item, a click anywhere else closes it
  * Actions are posted to the hooks module as `{ pick | open | copy: id }`.
  */
-// `cols` is the pane's width, for before the region has been laid out.
-const Canvas: ClientModule<Drawing & { cols: number; name: string }, Pan> = (d, s) => {
+// `cols` and `regionRows` are the region's size, for before it has been laid out.
+const Canvas: ClientModule<Drawing & { cols: number; regionRows: number; name: string }, Pan> = (d, s) => {
   const view = s.columns || d.cols
   const max = Math.max(0, d.width - view)
   const clamp = (x: number) => Math.max(0, Math.min(max, x))
   // Until the person pans, the window opens centered on the top rank: where the diagram starts.
-  const top = d.boxes.filter(b => b.y === 0)
+  // The top rank sits lower when a group's border starts there: take the highest boxes.
+  const minY = d.boxes.reduce((m, b) => Math.min(m, b.y), Infinity)
+  const top = d.boxes.filter(b => b.y === minY)
   const start = top.length === 0 ? 0 : (Math.min(...top.map(b => b.x)) + Math.max(...top.map(b => b.x + b.w))) / 2
   // Saved state counts only when it exists and is for this diagram: after a hot reload the
   // props can predate `name`, and undefined === undefined would claim state that isn't there.
@@ -47,8 +49,9 @@ const Canvas: ClientModule<Drawing & { cols: number; name: string }, Pan> = (d, 
     const actions: Action[] = box.detail ? ['pick', 'open', 'copy'] : ['pick', 'copy']
     const items = actions.map(a => LABELS[a])
     const { w, h } = menuSize(items)
-    const mx = Math.max(pan, Math.min(x + pan, pan + view - w, d.width - w))
-    const my = Math.max(0, Math.min(y + 1, d.height - h))
+    // The menu may reach past a small diagram (the grid grows for it), not past the region.
+    const mx = Math.max(pan, Math.min(x + pan, pan + view - w))
+    const my = Math.max(0, Math.min(y + 1, Math.max(d.height, s.rows || d.regionRows || 0) - h))
     return { id: box.id, actions, items, x: Math.max(0, mx), y: my }
   }
   const menuItem = (m: Open, x: number, y: number, pan: number) => {
