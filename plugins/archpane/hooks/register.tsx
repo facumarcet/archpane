@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Current, Diagram, DiagramNode, Status } from '../types'
 import { draw, toDrawing } from './draw'
-import { applyPatch, check, empty, layout, STATUSES, type Patch } from './lib'
+import { applyPatch, check, empty, layout, review, STATUSES, type Patch } from './lib'
 
 const PANE = 'archpane'
 const TOOL = 'mcp__archpane__diagram'
@@ -18,7 +18,7 @@ const node = {
     id: { type: 'string', description: 'Stable id, e.g. "order-worker"' },
     label: { type: 'string', description: 'Shown name; defaults to id' },
     kind: { type: 'string', description: 'e.g. service, worker, db, queue, cache, external' },
-    group: { type: 'string', description: 'Layer or boundary it belongs to' },
+    group: { type: 'string', description: 'Layer or boundary it belongs to; members are drawn inside a labeled border' },
     status: { type: 'string', enum: STATUSES },
     note: { type: 'string', description: 'One line shown on hover' },
   },
@@ -138,7 +138,7 @@ export const register: Register = on => {
         const problem = check(diagram)
         if (problem !== undefined) return { deny: `diagram not changed: ${problem}` }
         await show($, { name, diagram })
-        return answer(`"${name}" now has ${diagram.nodes.length} components and ${diagram.edges.length} edges.`)
+        return answer(`"${name}" now has ${diagram.nodes.length} components and ${diagram.edges.length} edges. ${review(diagram)}`)
       }
       default:
         return { deny: `unknown op "${input.op}"` }
