@@ -215,3 +215,78 @@ test('clicking a box puts a reference to it in the prompt and highlights it; a d
   expect(cyan.map(t => t.text)).toContain(`╭${'─'.repeat(api.w - 2)}╮`)
   expect(cyan.every(t => /^[╭╮╰╯─│]+$/.test(t.text))).toBe(true)
 })
+
+const parent = {
+  nodes: [{ id: 'gate', label: 'Gateway' }, { id: 'api', label: 'Orders API', detail: 'sub/inner' }, { id: 'db' }],
+  edges: [{ from: 'gate', to: 'api' }, { from: 'api', to: 'db' }],
+}
+const inner = { nodes: [{ id: 'handler' }, { id: 'repo' }], edges: [{ from: 'handler', to: 'repo' }] }
+const PANE_PROPS = { title: 'Diagram', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } as const
+
+test('a box linking a detail diagram is marked, the tool says when that diagram is not drawn yet', async ($, on) => {
+  engine(on)
+  const said = await $.tool.call({ tool: TOOL, op: 'set', name: 'sub', diagram: parent })
+  expect(String(said.result)).toMatch(/Detail diagrams linked but not drawn yet: sub\/inner\./)
+  await $.tool.call({ tool: TOOL, op: 'set', name: 'sub/inner', diagram: inner })
+  const again = await $.tool.call({ tool: TOOL, op: 'set', name: 'sub', diagram: parent })
+  expect(String(again.result)).not.toMatch(/not drawn yet/)
+  expect(layout(parent as never).boxes.find(b => b.node.id === 'api')!.label).toBe('Orders API ▸')
+})
+
+test('left-clicking a ▸ box opens its detail diagram, and the breadcrumb leads back', async ($, on) => {
+  engine(on)
+  await $.tool.call({ tool: TOOL, op: 'set', name: 'sub/inner', diagram: inner })
+  await $.tool.call({ tool: TOOL, op: 'set', name: 'sub', diagram: parent })
+  const ui = await $.ui.mount({ plugin: 'archpane', surface: 'terminal', component: 'Pane', requestId: 'archpane', props: PANE_PROPS })
+  const api = layout(parent as never).boxes.find(b => b.node.id === 'api')!
+  const open = async () => JSON.parse(String((await $.tool.call({ tool: TOOL, op: 'get' })).result)).name
+
+  await ui.pointer({ in: 'canvas', type: 'down', x: api.x + 2, y: api.y + 1, button: 'left' })
+  await ui.pointer({ in: 'canvas', type: 'up', x: api.x + 2, y: api.y + 1, button: 'left' })
+  expect(await open()).toBe('sub/inner')
+  expect(await ui.find({ type: 'Button', key: 'crumb:0' })).toBeDefined()
+  expect((await shown(ui)).join('\n')).toContain('handler')
+
+  await ui.press({ key: 'crumb:0' })
+  expect(await open()).toBe('sub')
+  expect(await ui.find({ type: 'Button', key: 'crumb:0' })).toBeUndefined()
+})
+
+test('right-clicking a box shows its menu; its items ask about it or copy its id', async ($, on) => {
+  engine(on)
+  const filled: string[] = []
+  const copied: string[] = []
+  on('prompt.fill', (_$, e) => {
+    filled.push(e.text)
+    return { isFilled: true as const, box: { text: e.text, cursor: e.text.length } }
+  })
+  on('ui.copy', (_$, e) => {
+    copied.push(e.text)
+    return { isCopied: true as const }
+  })
+  on('ui.toast', () => ({}))
+  await $.tool.call({ tool: TOOL, op: 'set', name: 'sub', diagram: parent })
+  const ui = await $.ui.mount({ plugin: 'archpane', surface: 'terminal', component: 'Pane', requestId: 'archpane', props: PANE_PROPS })
+  const api = layout(parent as never).boxes.find(b => b.node.id === 'api')!
+  const rightClick = async () => {
+    await ui.pointer({ in: 'canvas', type: 'down', x: api.x + 2, y: api.y + 1, button: 'right' })
+    await ui.pointer({ in: 'canvas', type: 'up', x: api.x + 2, y: api.y + 1, button: 'right' })
+  }
+  const choose = async (item: string) => {
+    const lines = await shown(ui)
+    const y = lines.findIndex(l => l.includes(item))
+    await ui.pointer({ in: 'canvas', type: 'down', x: lines[y]!.indexOf(item) + 1, y, button: 'left' })
+    await ui.pointer({ in: 'canvas', type: 'up', x: lines[y]!.indexOf(item) + 1, y, button: 'left' })
+  }
+
+  await rightClick()
+  const menu = (await shown(ui)).join('\n')
+  for (const item of ['Ask about this', 'Open detail ▸', 'Copy id']) expect(menu).toContain(item)
+  await choose('Ask about this')
+  expect(filled).toEqual(['[diagram sub: api] '])
+  expect((await shown(ui)).join('\n')).not.toContain('Copy id')
+
+  await rightClick()
+  await choose('Copy id')
+  expect(copied).toEqual(['api'])
+})

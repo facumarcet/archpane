@@ -47,7 +47,7 @@ export function check(d: Diagram): string | undefined {
     if (!isStr(n?.id) || n.id === '') return 'every node needs a non-empty string id'
     if (ids.has(n.id)) return `duplicate node id "${n.id}"`
     ids.add(n.id)
-    if (![n.label, n.kind, n.group, n.note].every(optStr)) return `node "${n.id}": label/kind/group/note must be strings`
+    if (![n.label, n.kind, n.group, n.note, n.detail].every(optStr)) return `node "${n.id}": label/kind/group/note/detail must be strings`
     if (n.status !== undefined && !STATUSES.includes(n.status)) {
       return `node "${n.id}": status must be one of ${STATUSES.join(', ')}`
     }
@@ -151,8 +151,12 @@ export function layout(d: Diagram): Layout {
 
   const items: Item[] = d.nodes.map(n => {
     const sub = [n.kind, n.status].filter(Boolean).join(' · ')
-    const w = Math.min(MAX_W, Math.max(MIN_W, (n.label ?? n.id).length + 4, sub.length + 4))
-    return { node: n, group: n.group || undefined, rank: ranks.get(n.id)!, w, label: clip(n.label ?? n.id, w - 4), sub: clip(sub, w - 4) }
+    // A box that opens into a diagram of its own says so after its label.
+    const mark = n.detail ? ' ▸' : ''
+    const base = n.label ?? n.id
+    const w = Math.min(MAX_W, Math.max(MIN_W, base.length + mark.length + 4, sub.length + 4))
+    const label = clip(base, w - 4 - mark.length) + mark
+    return { node: n, group: n.group || undefined, rank: ranks.get(n.id)!, w, label, sub: clip(sub, w - 4) }
   })
   const itemOf = new Map(d.nodes.map((n, i) => [n.id, i]))
   const segs: Seg[] = []

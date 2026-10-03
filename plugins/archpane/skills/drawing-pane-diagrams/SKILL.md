@@ -21,9 +21,10 @@ The pane is a narrow terminal column (~60–110 columns) that someone reads whil
 
 ## A system bigger than that
 
-1. **Overview:** a diagram named `<topic>` with one box per stage, 8 boxes or fewer. Each stage's note ends with `detail: <topic>/<stage>`.
+1. **Overview:** a diagram named `<topic>` with one box per stage, 8 boxes or fewer. Set each stage box's `detail` to `"<topic>/<stage>"`: the box is marked ▸, and clicking it opens that diagram.
 2. **Detail diagrams:** one per stage, named `<topic>/<stage>`, each following the shape above. Show what the stage connects to as the first or last box.
-3. **What to tell the user:** open the overview, then list the detail diagrams (`/diagram <topic>/<stage>`).
+3. **Draw every diagram you link.** The tool lists linked diagrams that aren't drawn yet.
+4. **What to tell the user:** the overview is open. Clicking a ▸ box opens its detail, and the breadcrumb at the top leads back.
 
 ## Plans and builds
 
