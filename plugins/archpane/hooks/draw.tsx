@@ -26,9 +26,10 @@ export const toDrawing = (l: Layout, color: (status?: string) => string | undefi
 /**
  * The diagram in the flow, so a vertical scroll moves all of it: each rank is a
  * row of spacers and boxes with the right-hand channel beside it, the rest are
- * edge rows. `panX` columns are cut off the left inside a `cols`-wide window.
+ * edge rows. `panX` columns are cut off the left inside a `cols`-wide window;
+ * the `picked` box is drawn bold and cyan.
  */
-export function draw({ Box, Text }: Pick<ClientElements, 'Box' | 'Text'>, d: Drawing, panX: number, cols: number) {
+export function draw({ Box, Text }: Pick<ClientElements, 'Box' | 'Text'>, d: Drawing, panX: number, cols: number, picked?: string) {
   const byY = new Map<number, Drawing['boxes']>()
   for (const b of d.boxes) byY.set(b.y, [...(byY.get(b.y) ?? []), b])
 
@@ -51,8 +52,8 @@ export function draw({ Box, Text }: Pick<ClientElements, 'Box' | 'Text'>, d: Dra
           flexShrink={0}
           flexDirection="column"
           paddingX={1}
-          borderStyle="round"
-          borderColor={b.color}
+          borderStyle={b.id === picked ? 'bold' : 'round'}
+          borderColor={b.id === picked ? 'cyan' : b.color}
           hover={{ scope: `n:${b.id}`, borderStyle: 'double' }}
         >
           <Text bold wrap="truncate">{b.label}</Text>

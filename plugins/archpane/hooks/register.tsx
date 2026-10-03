@@ -37,7 +37,8 @@ ops:
 - set: replace the whole diagram (title, nodes, edges).
 - patch: incremental edit. nodes upsert by id (fields merge), edges upsert by from→to, removeNodes (drops their edges), removeEdges.
 - list: diagram names in this repository. open: switch the pane to a diagram (created empty if new). delete: remove one.
-Edges point from caller to callee / producer to consumer. Keep labels short; ids stable.`
+Edges point from caller to callee / producer to consumer. Keep labels short; ids stable.
+The user can click a box to put [diagram <name>: <id>] in their prompt: that names a component, look it up with get.`
 
 type Input = Patch & { op: string; name?: string; diagram?: Diagram }
 
@@ -179,6 +180,19 @@ export const register: Register = on => {
     )
   })
 
+  // A click on a box in the canvas: reference that component in the prompt.
+  on('ui.message', { requestId: PANE }, async ($, e) => {
+    const pick = (e.data as { pick?: unknown } | null)?.pick
+    const cur = await read($, current)
+    const node = cur?.diagram.nodes.find(n => n.id === pick)
+    if (cur && node) {
+      const ref = `[diagram ${cur.name}: ${node.id}]`
+      await $.prompt.fill({ text: `${ref} `, mode: 'insert', decorations: [{ start: 0, end: ref.length, color: 'cyan' }] })
+    }
+
+    return {}
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     const cur = await read($, current)
@@ -213,7 +227,7 @@ export const register: Register = on => {
           {STATUSES.map(s => (
             <Text color={COLOR[s]}>■ {s}  </Text>
           ))}
-          <Text dimColor>{isWide ? '· drag sideways to pan · hover for details' : '· hover a box for details'}</Text>
+          <Text dimColor>{isWide ? '· click a box to ask · drag to pan' : '· click a box to ask about it'}</Text>
         </Text>
         {body}
       </Box>

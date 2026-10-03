@@ -8,7 +8,8 @@ A live architecture diagram in a side pane of Claude Code. Claude draws it and e
 - **Edit by talking:** "add a Redis cache in front of the API", "mark the worker as done", "what does the queue feed?"
 - **Build status:** each component can be `planned`, `building`, `done` or `blocked`, shown by color. Claude can update statuses as it builds.
 - **Hover a box** to see its details (kind, group, note, outgoing edges) in a fixed line above the prompt.
-- **Drag sideways** to pan wide diagrams. The mouse wheel scrolls vertically. After clicking into the diagram, `h`/`l` or `←`/`→` pan too.
+- **Drag sideways** to pan wide diagrams. The mouse wheel scrolls vertically.
+- **Click a box** to put a reference to it (`[diagram <name>: <id>]`) in your prompt, then ask about it.
 - **Saved across sessions,** per repository and per diagram name.
 - **Works in any terminal.** It's drawn with text and box-drawing characters, not images. It also works in the desktop app's Code tab. VS Code and mobile get a static drawing.
 
@@ -41,7 +42,7 @@ archpane is a Claude Code mod: a plugin made of function hooks.
 | The `diagram` tool Claude calls (`get`, `set`, `patch`, `list`, `open`, `delete`), input checks, saving in the plugin store | `hooks/register.tsx` |
 | The diagram model, patching, and the layout (ranks, ordering, orthogonal edge routing in terminal cells) | `hooks/lib.ts` |
 | Drawing a laid-out diagram as boxes and edge rows in the normal flow | `hooks/draw.tsx` |
-| The `Client` region that draws it and turns pointer drags and keys into panning | `hooks/canvas.tsx` |
+| The `Client` region that draws it, pans on drag, and turns a click on a box into a prompt reference | `hooks/canvas.tsx` |
 
 The diagram itself is plain JSON: nodes `{ id, label, kind, group, status, note }` and edges `{ from, to, label }`. Claude reads it back with `get` before answering questions about it, so the diagram, not the chat history, is the source of truth.
 
