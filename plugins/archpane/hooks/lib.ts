@@ -39,6 +39,39 @@ export function applyPatch(d: Diagram, p: Patch): Diagram {
   }
 }
 
+/**
+ * JSON text the model is still writing, cut after the last object or array it finished and
+ * closed off: the values written so far, whole. Undefined until one has ended.
+ */
+export function partialJson(text: string): unknown {
+  let stack = ''
+  let open = ''
+  let cut = -1
+  let inString = false
+  let escaped = false
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (c === '\\') escaped = true
+      else if (c === '"') inString = false
+    } else if (c === '"') inString = true
+    else if (c === '{' || c === '[') stack += c
+    else if (c === '}' || c === ']') {
+      stack = stack.slice(0, -1)
+      cut = i + 1
+      open = stack
+    }
+  }
+  if (cut < 0) return undefined
+  const close = [...open].reverse().map(c => (c === '{' ? '}' : ']')).join('')
+  try {
+    return JSON.parse(text.slice(0, cut) + close)
+  } catch {
+    return undefined
+  }
+}
+
 const isStr = (v: unknown): v is string => typeof v === 'string'
 const optStr = (v: unknown) => v === undefined || isStr(v)
 

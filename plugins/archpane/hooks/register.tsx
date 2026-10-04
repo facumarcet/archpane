@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Current, Diagram, DiagramNode, Status } from '../types'
 import { draw, drawnSize, toDrawing, type Drawing } from './draw'
-import { applyPatch, check, empty, layout, review, STATUSES, type Patch } from './lib'
+import { applyPatch, check, empty, layout, partialJson, review, STATUSES, type Patch } from './lib'
 
 const PANE = 'archpane'
 const TOOL = 'mcp__archpane__diagram'
@@ -83,6 +83,39 @@ const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`
 
 const answer = (value: unknown) => ({ result: typeof value === 'string' ? value : JSON.stringify(value) })
 
+// What a set or patch makes of the saved diagram; throws on input of the wrong shape.
+const edited = (input: Input, base: Diagram): Diagram =>
+  input.op === 'set'
+    ? {
+        title: input.diagram?.title ?? input.title,
+        nodes: input.diagram?.nodes ?? input.nodes ?? [],
+        edges: input.diagram?.edges ?? input.edges ?? [],
+      }
+    : applyPatch(base, input)
+
+/**
+ * Draws a set or patch the model is still writing: the boxes and edges it has finished, in
+ * the pane and unsaved. `call.shown` is what was drawn last, so only a change redraws.
+ */
+async function preview($: EngineInterface, call: { json: string; shown: string }) {
+  const input = partialJson(call.json) as Input | undefined
+  if (input?.op !== 'set' && input?.op !== 'patch') return
+  const name = input.name?.trim() || (await read($, current))?.name || DEFAULT
+  let diagram: Diagram
+  try {
+    diagram = edited(input, (await load($, name)).diagram)
+  } catch {
+    return
+  }
+  // An edge can arrive before the box it points at.
+  const ids = new Set(diagram.nodes.map(n => n.id))
+  diagram = { ...diagram, edges: diagram.edges.filter(ed => ids.has(ed.from) && ids.has(ed.to)) }
+  const shown = JSON.stringify(diagram)
+  if (shown === call.shown || check(diagram) !== undefined) return
+  call.shown = shown
+  await show($, { name, diagram }, [], false)
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'diagram', description: 'Open the architecture diagram pane: /diagram [name]' })
@@ -135,7 +168,8 @@ export const register: Register = on => {
     const input = e as unknown as Input
     const open = await read($, current)
     const name = input.name?.trim() || open?.name || DEFAULT
-    const base = name === open?.name ? open : await load($, name)
+    // From the store, not the pane: the pane may hold this call's unsaved preview.
+    const base = await load($, name)
 
     switch (input.op) {
       case 'get':
@@ -154,14 +188,7 @@ export const register: Register = on => {
       case 'patch': {
         let diagram: Diagram
         try {
-          diagram =
-            input.op === 'set'
-              ? {
-                  title: input.diagram?.title ?? input.title,
-                  nodes: input.diagram?.nodes ?? input.nodes ?? [],
-                  edges: input.diagram?.edges ?? input.edges ?? [],
-                }
-              : applyPatch(base.diagram, input)
+          diagram = edited(input, base.diagram)
         } catch {
           return { deny: 'diagram not changed: nodes, edges, removeNodes and removeEdges must be arrays of the documented shape' }
         }
@@ -183,6 +210,32 @@ export const register: Register = on => {
       default:
         return { deny: `unknown op "${input.op}"` }
     }
+  })
+
+  // A diagram call draws while the model writes it, box by box; the call itself saves it.
+  on('turn.step', async function* ($, e, next) {
+    const calls = new Map<number, { json: string; shown: string }>()
+    const stream = next(e)
+    for await (const chunk of stream) {
+      yield chunk
+      if (chunk.kind === 'tool' && chunk.name === TOOL) calls.set(chunk.index, { json: '', shown: '' })
+      const call = chunk.kind === 'input' ? calls.get(chunk.index) : undefined
+      if (call && chunk.kind === 'input') {
+        call.json += chunk.json
+        await preview($, call)
+      }
+    }
+    return await stream.result
+  })
+
+  // A preview no call saved (interrupted, denied, refused) gives way to what is saved.
+  on('turn.complete', async ($, e, next) => {
+    const cur = await read($, current)
+    if (cur !== null) {
+      const saved = await load($, cur.name)
+      if (JSON.stringify(saved.diagram) !== JSON.stringify(cur.diagram)) await update($, current, () => saved)
+    }
+    return next(e)
   })
 
   // The hover detail lives in the band above the prompt: it stays put while the pane scrolls.

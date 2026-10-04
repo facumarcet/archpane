@@ -16,6 +16,7 @@ archpane is a Claude Code mod: a plugin made of function hooks, plus one skill.
 - **Hover needs sibling runs.** Each row is a row of sibling `Text` runs, because a `Text` nested in another can't trigger its hover group on the terminal.
 - **The canvas never takes the keyboard.** A `Client` with a key listener takes focus on click, so all interaction is pointer-only and the prompt keeps the keyboard.
 - **Size limits come from the engine.** It refuses canvas data or a drawn tree past 100,000 serialized characters, so the tool refuses a diagram that would exceed that and tells Claude to split it.
+- **Diagrams draw as Claude writes them.** A `turn.step` hook reads the `diagram` call's arguments as they stream, cuts the JSON after the last finished box or edge, and shows that in the pane unsaved. The call saves it when it runs; at turn end, a preview nothing saved gives way to the saved diagram.
 - **Hot reloads can hand new canvas code old data.** The canvas tolerates missing fields in its props.
 
 ## Development

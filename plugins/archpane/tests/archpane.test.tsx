@@ -2,7 +2,7 @@ import type { On } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
 import { screen, toDrawing } from '../hooks/draw'
-import { BOX_H, layout, review, textWidth } from '../hooks/lib'
+import { BOX_H, layout, partialJson, review, textWidth } from '../hooks/lib'
 
 const TOOL = 'mcp__archpane__diagram'
 const diagram = {
@@ -388,4 +388,45 @@ test('the canvas opens centered on the top rank even when a group border pushes 
   const start = Math.max(0, Math.min(l.width - 20, Math.round(mid - 10)))
   const full = screen(toDrawing(l, () => undefined))
   expect(await shown(ui)).toEqual(full.map(r => r.padEnd(l.width).slice(start, start + 20).trimEnd()).concat(Array(Math.max(0, 10 - l.height)).fill('')))
+})
+
+// ---- streaming --------------------------------------------------------------
+
+test('partialJson keeps the values finished so far and ignores brackets inside strings', () => {
+  expect(partialJson('{"op":"set","diagram":{"nodes":[{"id":"a"},{"id":"b","note":"x ]}')).toEqual({ op: 'set', diagram: { nodes: [{ id: 'a' }] } })
+  expect(partialJson('{"op":"set","diagram":{"nodes":[{"id":"a\\"}"}')).toEqual({ op: 'set', diagram: { nodes: [{ id: 'a"}' }] } })
+  expect(partialJson('{"op":"set","name":"x"')).toBeUndefined()
+  expect(partialJson(JSON.stringify(diagram))).toEqual(diagram)
+})
+
+test('a set draws box by box while the model writes it, unsaved, and an unfinished one gives way at turn end', async ($, on) => {
+  engine(on)
+  const json = JSON.stringify({ op: 'set', name: 'live', diagram })
+  // The response stops partway through the call, after the first two boxes.
+  const upTo = json.indexOf('{"id":"queue"')
+  on('turn.step', async function* (_$, e) {
+    yield { kind: 'tool' as const, index: 1, id: 'tu1', name: TOOL }
+    for (const p of json.slice(0, upTo).match(/.{1,7}/gs)!) yield { kind: 'input' as const, index: 1, json: p }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: null, usage: null }
+  })
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  const ui = await $.ui.mount({
+    plugin: 'archpane',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'archpane',
+    props: { title: 'Diagram', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+  })
+  const pane = async () => JSON.stringify(await ui.drawn({})).includes('canvas') ? (await shown(ui)).join('\n') : ''
+
+  for await (const _ of $.turn.step({ turnId: 't', index: 0, model: 'm', messageCount: 1 }));
+  expect(await pane()).toContain('Orders API')
+  expect(await pane()).toContain('worker')
+  expect(await pane()).not.toContain('queue')
+  const saved = JSON.parse(String((await $.tool.call({ tool: TOOL, op: 'get', name: 'live' })).result))
+  expect(saved.diagram.nodes).toEqual([])
+
+  // No call ran, so the turn's end puts back what is saved.
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't', reason: 'aborted' })
+  expect(await pane()).toBe('')
 })
