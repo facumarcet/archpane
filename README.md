@@ -2,7 +2,7 @@
 
 **A live architecture diagram in a side pane of Claude Code.** Ask Claude to diagram a system and it draws it next to the chat, then keeps it current while you talk.
 
-![The checkout overview in the archpane pane](docs/overview.png)
+![Clicking through the checkout example in archpane: asking about a box, opening a subdiagram, and referencing a component in the prompt](docs/demo.gif)
 
 ## What it does
 
@@ -11,8 +11,6 @@
 - **Ask about any component.** Click a box to put `[diagram <name>: <id>]` in your prompt, then type your question.
 - **Track a build.** Components are `planned`, `building`, `done` or `blocked`, shown by color, and Claude updates them as the work lands.
 - **Explore it with the mouse.** Hover for details, right-click for a menu, drag to pan.
-
-![A subdiagram opened from the overview, with its breadcrumb](docs/subdiagram.png)
 
 ## Requirements
 
