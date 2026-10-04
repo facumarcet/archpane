@@ -4,8 +4,9 @@ archpane is a Claude Code mod: a plugin made of function hooks, plus one skill.
 
 | Piece | File |
 | --- | --- |
-| The `diagram` tool Claude calls (`get`, `set`, `patch`, `list`, `open`, `delete`), input checks, saving in the plugin store, the `/diagram` command, the pane and its breadcrumb, and the hover line above the prompt | `plugins/archpane/hooks/register.tsx` |
-| The diagram model and a layered (Sugiyama-style) layout: cycles reversed, long edges split into waypoints, crossing-reducing ordering sweeps, orthogonal routing in terminal cells, group borders, and the size review Claude reads after each edit | `plugins/archpane/hooks/lib.ts` |
+| The `diagram` tool's contract with Claude: its description, input schema, and the check of its top-level input | `plugins/archpane/hooks/tool.ts` |
+| What the tool's ops (`get`, `set`, `patch`, `list`, `open`, `delete`) do, saving in the plugin store, the `/diagram` command, the pane and its breadcrumb, and the hover line above the prompt | `plugins/archpane/hooks/register.tsx` |
+| The diagram model and a layered (Sugiyama-style) layout: cycles reversed, long edges split into waypoints, crossing-reducing ordering sweeps, orthogonal routing in terminal cells, group borders (one function per phase, `layout()` runs them in order), and the size review Claude reads after each edit | `plugins/archpane/hooks/lib.ts` |
 | Painting boxes, edges, groups and the right-click menu into one character grid, sliced to the visible columns and drawn as rows of text runs | `plugins/archpane/hooks/draw.tsx` |
 | The `Client` region that draws it, pans on drag, opens a subdiagram or asks about a box on click, and shows the right-click menu | `plugins/archpane/hooks/canvas.tsx` |
 | How Claude should author diagrams for a narrow pane, including splitting a large system into an overview plus `<topic>/<stage>` detail diagrams | `plugins/archpane/skills/drawing-pane-diagrams/SKILL.md` |
