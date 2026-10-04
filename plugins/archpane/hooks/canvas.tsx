@@ -4,7 +4,8 @@ import { draw, menuSize, type Drawing, type Menu } from './draw'
 import { BOX_H } from './lib'
 
 type Action = 'pick' | 'open' | 'copy'
-type Open = Menu & { id: string; actions: Action[] }
+/** An open menu: the box it's for, and what it offers, top to bottom. */
+type Open = Omit<Menu, 'items'> & { id: string; actions: Action[] }
 type Pan = {
   // The diagram this state belongs to: another one starts fresh.
   name: string
@@ -16,6 +17,7 @@ type Pan = {
 }
 
 const LABELS: Record<Action, string> = { pick: 'Ask about this', open: 'Open detail ▸', copy: 'Copy id' }
+const toMenu = ({ x, y, actions }: Open): Menu => ({ x, y, items: actions.map(a => LABELS[a]) })
 
 /**
  * Draws the diagram and turns the pointer into its actions, all without the
@@ -47,15 +49,14 @@ const Canvas: ClientModule<Drawing & { cols: number; regionRows: number; name: s
   // A menu opens under the click, kept inside the diagram and the visible window.
   const menuAt = (box: Drawing['boxes'][number], x: number, y: number, pan: number): Open => {
     const actions: Action[] = box.detail ? ['pick', 'open', 'copy'] : ['pick', 'copy']
-    const items = actions.map(a => LABELS[a])
-    const { w, h } = menuSize(items)
+    const { w, h } = menuSize(actions.map(a => LABELS[a]))
     // The menu may reach past a small diagram (the grid grows for it), not past the region.
     const mx = Math.max(pan, Math.min(x + pan, pan + view - w))
     const my = Math.max(0, Math.min(y + 1, Math.max(d.height, s.rows || d.regionRows || 0) - h))
-    return { id: box.id, actions, items, x: Math.max(0, mx), y: my }
+    return { id: box.id, actions, x: Math.max(0, mx), y: my }
   }
   const menuItem = (m: Open, x: number, y: number, pan: number) => {
-    const { w } = menuSize(m.items)
+    const { w } = menuSize(toMenu(m).items)
     const i = y - m.y - 1
     return x + pan > m.x && x + pan < m.x + w - 1 && i >= 0 && i < m.actions.length ? m.actions[i] : undefined
   }
@@ -95,7 +96,7 @@ const Canvas: ClientModule<Drawing & { cols: number; regionRows: number; name: s
   })
 
   const pan = now()
-  return draw(s.elements, d, clamp(pan.panX), view, pan.picked, pan.menu)
+  return draw(s.elements, d, clamp(pan.panX), view, pan.picked, pan.menu && toMenu(pan.menu))
 }
 
 export default Canvas

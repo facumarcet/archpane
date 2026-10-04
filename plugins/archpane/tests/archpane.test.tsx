@@ -1,11 +1,12 @@
 import type { On } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
+import type { Diagram } from '../types'
 import { screen, toDrawing } from '../hooks/draw'
 import { BOX_H, layout, partialJson, review, textWidth } from '../hooks/lib'
 
 const TOOL = 'mcp__archpane__diagram'
-const diagram = {
+const diagram: Diagram = {
   title: 'Orders',
   nodes: [
     { id: 'api', label: 'Orders API', kind: 'service', status: 'done' },
@@ -40,7 +41,7 @@ const engine = (on: On) => {
 }
 
 test('layout ranks top-down, keeps edges out of boxes, and gives every edge one arrowhead', () => {
-  const l = layout(diagram as never)
+  const l = layout(diagram)
   const y = (id: string) => l.boxes.find(b => b.node.id === id)!.y
   expect(y('api') < y('queue') && y('queue') < y('worker') && y('worker') < y('db')).toBe(true)
   for (const b of l.boxes) {
@@ -53,7 +54,7 @@ test('layout ranks top-down, keeps edges out of boxes, and gives every edge one 
 })
 
 test('groups get one border per run of ranks that holds their members, and nothing else', () => {
-  const grouped = {
+  const grouped: Diagram = {
     nodes: [
       { id: 'web', group: 'edge' },
       { id: 'api', group: 'core' },
@@ -75,7 +76,7 @@ test('groups get one border per run of ranks that holds their members, and nothi
       { from: 'api', to: 'stray' },
     ],
   }
-  const l = layout(grouped as never)
+  const l = layout(grouped)
   type R = { x: number; y: number; w: number; h: number }
   const within = (b: R, g: R) => b.x >= g.x && b.x + b.w <= g.x + g.w && b.y >= g.y && b.y + b.h <= g.y + g.h
   const meets = (a: R, b: R) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
@@ -92,8 +93,8 @@ test('groups get one border per run of ranks that holds their members, and nothi
 })
 
 test('review says a small diagram fits, and names the fix when one is too wide, skips levels or has lonely groups', () => {
-  expect(review(diagram as never)).toMatch(/fits the pane/)
-  const wide = {
+  expect(review(diagram)).toMatch(/fits the pane/)
+  const wide: Diagram = {
     nodes: [
       { id: 'top' },
       ...Array.from({ length: 8 }, (_, i) => ({ id: `mid${i}`, label: `middle service ${i}`, group: i === 0 ? 'solo' : undefined })),
@@ -111,7 +112,7 @@ test('review says a small diagram fits, and names the fix when one is too wide, 
       { from: 'mid2', to: 'c' },
     ],
   }
-  const said = review(wide as never)
+  const said = review(wide)
   expect(said).toMatch(/columns wide, past the ~100 a pane shows \(widest level: 8 boxes\)/)
   expect(said).toMatch(/3 edges skip levels/)
   expect(said).toMatch(/group border around a single box \(solo\)/)
@@ -130,6 +131,13 @@ test('patch rejects an edge to an unknown node and leaves the diagram alone', as
   expect(bad.deny).toMatch(/unknown node "nope"/)
   const got = await $.tool.call({ tool: TOOL, op: 'get', name: 't1' })
   expect(JSON.parse(String(got.result)).diagram.nodes.length).toBe(4)
+})
+
+test('a call with a malformed op, name or title is refused before anything changes', async ($, on) => {
+  engine(on)
+  expect((await $.tool.call({ tool: TOOL, op: 7 } as never)).deny).toMatch(/op must be a string/)
+  expect((await $.tool.call({ tool: TOOL, op: 'get', name: 3 } as never)).deny).toMatch(/name must be a string/)
+  expect((await $.tool.call({ tool: TOOL, op: 'set', title: {}, diagram } as never)).deny).toMatch(/title must be a string/)
 })
 
 test('patch merges nodes, removing a node drops its edges, and it persists', async ($, on) => {
@@ -161,8 +169,8 @@ for (const surface of ['terminal', 'desktop'] as const) {
 test('dragging the diagram pans it sideways, showing exactly that slice, and stops at its edge', async ($, on) => {
   engine(on)
   await $.tool.call({ tool: TOOL, op: 'set', name: 'pan', diagram })
-  const full = screen(toDrawing(layout(diagram as never), () => undefined))
-  const width = layout(diagram as never).width
+  const full = screen(toDrawing(layout(diagram), () => undefined))
+  const width = layout(diagram).width
   const ui = await $.ui.mount({
     plugin: 'archpane',
     surface: 'terminal',
@@ -171,7 +179,7 @@ test('dragging the diagram pans it sideways, showing exactly that slice, and sto
     props: { title: 'Diagram', isFocused: true, bodyColumns: 10, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
   })
   const window = (pan: number) => full.map(r => r.padEnd(width).slice(pan, pan + 10).trimEnd())
-  const api = layout(diagram as never).boxes.find(b => b.node.id === 'api')!
+  const api = layout(diagram).boxes.find(b => b.node.id === 'api')!
   const start = Math.max(0, Math.min(width - 10, Math.round(api.x + api.w / 2 - 5)))
 
   // It opens centered on the top rank (api alone here), not at column 0.
@@ -201,7 +209,7 @@ test('clicking a box puts a reference to it in the prompt and highlights it; a d
     requestId: 'archpane',
     props: { title: 'Diagram', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
   })
-  const api = layout(diagram as never).boxes.find(b => b.node.id === 'api')!
+  const api = layout(diagram).boxes.find(b => b.node.id === 'api')!
 
   await ui.pointer({ in: 'canvas', type: 'down', x: api.x + 2, y: api.y + 1, button: 'left' })
   await ui.pointer({ in: 'canvas', type: 'move', x: api.x + 12, y: api.y + 1, button: 'left' })
@@ -216,11 +224,11 @@ test('clicking a box puts a reference to it in the prompt and highlights it; a d
   expect(cyan.every(t => /^[╭╮╰╯─│]+$/.test(t.text))).toBe(true)
 })
 
-const parent = {
+const parent: Diagram = {
   nodes: [{ id: 'gate', label: 'Gateway' }, { id: 'api', label: 'Orders API', detail: 'sub/inner' }, { id: 'db' }],
   edges: [{ from: 'gate', to: 'api' }, { from: 'api', to: 'db' }],
 }
-const inner = { nodes: [{ id: 'handler' }, { id: 'repo' }], edges: [{ from: 'handler', to: 'repo' }] }
+const inner: Diagram = { nodes: [{ id: 'handler' }, { id: 'repo' }], edges: [{ from: 'handler', to: 'repo' }] }
 const PANE_PROPS = { title: 'Diagram', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } as const
 
 test('a box linking a detail diagram is marked, the tool says when that diagram is not drawn yet', async ($, on) => {
@@ -230,7 +238,7 @@ test('a box linking a detail diagram is marked, the tool says when that diagram 
   await $.tool.call({ tool: TOOL, op: 'set', name: 'sub/inner', diagram: inner })
   const again = await $.tool.call({ tool: TOOL, op: 'set', name: 'sub', diagram: parent })
   expect(String(again.result)).not.toMatch(/not drawn yet/)
-  expect(layout(parent as never).boxes.find(b => b.node.id === 'api')!.label).toBe('Orders API ▸')
+  expect(layout(parent).boxes.find(b => b.node.id === 'api')!.label).toBe('Orders API ▸')
 })
 
 test('left-clicking a ▸ box opens its detail diagram, and the breadcrumb leads back', async ($, on) => {
@@ -238,7 +246,7 @@ test('left-clicking a ▸ box opens its detail diagram, and the breadcrumb leads
   await $.tool.call({ tool: TOOL, op: 'set', name: 'sub/inner', diagram: inner })
   await $.tool.call({ tool: TOOL, op: 'set', name: 'sub', diagram: parent })
   const ui = await $.ui.mount({ plugin: 'archpane', surface: 'terminal', component: 'Pane', requestId: 'archpane', props: PANE_PROPS })
-  const api = layout(parent as never).boxes.find(b => b.node.id === 'api')!
+  const api = layout(parent).boxes.find(b => b.node.id === 'api')!
   const open = async () => JSON.parse(String((await $.tool.call({ tool: TOOL, op: 'get' })).result)).name
 
   await ui.pointer({ in: 'canvas', type: 'down', x: api.x + 2, y: api.y + 1, button: 'left' })
@@ -262,12 +270,12 @@ test('right-clicking a box shows its menu; its items ask about it or copy its id
   })
   on('ui.copy', (_$, e) => {
     copied.push(e.text)
-    return { isCopied: true as const }
+    return { value: { isCopied: true as const } }
   })
-  on('ui.toast', () => ({}))
+  on('ui.toast', () => ({ value: undefined }))
   await $.tool.call({ tool: TOOL, op: 'set', name: 'sub', diagram: parent })
   const ui = await $.ui.mount({ plugin: 'archpane', surface: 'terminal', component: 'Pane', requestId: 'archpane', props: PANE_PROPS })
-  const api = layout(parent as never).boxes.find(b => b.node.id === 'api')!
+  const api = layout(parent).boxes.find(b => b.node.id === 'api')!
   const rightClick = async () => {
     await ui.pointer({ in: 'canvas', type: 'down', x: api.x + 2, y: api.y + 1, button: 'right' })
     await ui.pointer({ in: 'canvas', type: 'up', x: api.x + 2, y: api.y + 1, button: 'right' })
@@ -308,7 +316,12 @@ test('a patched "" clears a field; /diagram list names the project diagrams', as
   const got = JSON.parse(String((await $.tool.call({ tool: TOOL, op: 'get', name: 'z' })).result))
   expect(got.diagram.nodes[0]).toEqual({ id: 'a', note: 'n' })
   await $.tool.call({ tool: TOOL, op: 'set', name: 'y', diagram: { nodes: [{ id: 'b' }], edges: [] } })
-  const listed = await $.command.run({ command: 'diagram', args: 'list' })
+  const listed = await $.command.run({
+    command: 'diagram',
+    args: 'list',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 120 },
+  })
   expect(listed.text).toBe('Diagrams in this project:\n  y\n  z')
 })
 
@@ -318,15 +331,15 @@ test('the worst diagram the caps allow lays out fast; one too large to draw is r
   const edges: { from: string; to: string }[] = nodes.slice(1).map((x, i) => ({ from: `n${i}`, to: x.id }))
   for (let i = 0; edges.length < 200; i++) edges.push({ from: `n${(i * 7) % 50}`, to: `n${50 + ((i * 13) % 50)}` })
   const t = Date.now()
-  layout({ nodes, edges } as never)
+  layout({ nodes, edges })
   expect(Date.now() - t < 1000).toBe(true)
   const refused = await $.tool.call({ tool: TOOL, op: 'set', name: 'big', diagram: { nodes, edges } })
   expect(refused.deny).toMatch(/too large to draw in the pane\. Split it into an overview and detail diagrams/)
 })
 
 test('wide characters take two cells: labels never split one, and box borders stay aligned', () => {
-  const d = { nodes: [{ id: 'r', label: '🚀 rocket service 🚀🚀🚀🚀' }, { id: 'k', label: '注文サービス' }], edges: [{ from: 'r', to: 'k' }] }
-  const l = layout(d as never)
+  const d: Diagram = { nodes: [{ id: 'r', label: '🚀 rocket service 🚀🚀🚀🚀' }, { id: 'k', label: '注文サービス' }], edges: [{ from: 'r', to: 'k' }] }
+  const l = layout(d)
   for (const b of l.boxes) expect(b.label.includes('\ud83d…')).toBe(false)
   const lines = screen(toDrawing(l, () => undefined))
   for (const b of l.boxes) {
@@ -340,7 +353,7 @@ test('the right-click menu shows whole on a one-box diagram', async ($, on) => {
   engine(on)
   await $.tool.call({ tool: TOOL, op: 'set', name: 'one', diagram: { nodes: [{ id: 'solo' }], edges: [] } })
   const ui = await $.ui.mount({ plugin: 'archpane', surface: 'terminal', component: 'Pane', requestId: 'archpane', props: PANE_PROPS })
-  const b = layout({ nodes: [{ id: 'solo' }], edges: [] } as never).boxes[0]!
+  const b = layout({ nodes: [{ id: 'solo' }], edges: [] }).boxes[0]!
   await ui.pointer({ in: 'canvas', type: 'down', x: b.x + 2, y: b.y + 1, button: 'right' })
   await ui.pointer({ in: 'canvas', type: 'up', x: b.x + 2, y: b.y + 1, button: 'right' })
   const all = (await shown(ui)).join('\n')
@@ -375,12 +388,12 @@ test('a detail cycle does not grow the breadcrumb; deleting a diagram drops its 
 
 test('the canvas opens centered on the top rank even when a group border pushes it down', async ($, on) => {
   engine(on)
-  const d = {
+  const d: Diagram = {
     nodes: [{ id: 'a', group: 'g' }, { id: 'b', group: 'g' }, { id: 'c', label: 'a very long label here' }, { id: 'e', label: 'another long label' }, { id: 'f', label: 'and one more' }],
     edges: [{ from: 'a', to: 'c' }, { from: 'b', to: 'e' }, { from: 'b', to: 'f' }],
   }
   await $.tool.call({ tool: TOOL, op: 'set', name: 'g', diagram: d })
-  const l = layout(d as never)
+  const l = layout(d)
   const top = l.boxes.filter(b => b.y === Math.min(...l.boxes.map(x => x.y)))
   expect(top[0]!.y > 0).toBe(true)
   const ui = await $.ui.mount({ plugin: 'archpane', surface: 'terminal', component: 'Pane', requestId: 'archpane', props: { ...PANE_PROPS, bodyColumns: 20 } })

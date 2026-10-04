@@ -3,48 +3,15 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Current, Diagram, DiagramNode, Status } from '../types'
 import { draw, drawnSize, toDrawing, type Drawing } from './draw'
-import { applyPatch, check, empty, layout, partialJson, review, STATUSES, type Patch } from './lib'
+import { applyPatch, check, empty, layout, partialJson, review, STATUSES, type Layout } from './lib'
+import { DEFAULT, DESCRIPTION, INPUT_SCHEMA, readInput, TOOL, type Input } from './tool'
 
 const PANE = 'archpane'
-const TOOL = 'mcp__archpane__diagram'
-const DEFAULT = 'main'
 const current = atom({ plugin: 'archpane', key: 'current' } as const, null)
 // The diagrams above the open one, outermost first: what the breadcrumb leads back to.
 const trail = atom({ plugin: 'archpane', key: 'trail' } as const, [])
 
 const COLOR: Record<Status, string> = { planned: 'gray', building: 'yellow', done: 'green', blocked: 'red' }
-
-const node = {
-  type: 'object',
-  properties: {
-    id: { type: 'string', description: 'Stable id, e.g. "order-worker"' },
-    label: { type: 'string', description: 'Shown name; defaults to id' },
-    kind: { type: 'string', description: 'e.g. service, worker, db, queue, cache, external' },
-    group: { type: 'string', description: 'Layer or boundary it belongs to; members are drawn inside a labeled border' },
-    status: { type: 'string', enum: STATUSES },
-    note: { type: 'string', description: 'One line shown on hover' },
-    detail: { type: 'string', description: 'Name of a diagram showing what happens inside this box (e.g. "checkout/payment"); the box is marked ▸ and clicking it opens that diagram' },
-  },
-  required: ['id'],
-}
-const edge = {
-  type: 'object',
-  properties: { from: { type: 'string' }, to: { type: 'string' }, label: { type: 'string' } },
-  required: ['from', 'to'],
-}
-
-const DESCRIPTION = `Draws and edits a live architecture/component diagram in the user's side pane. Diagrams persist per repository by name.
-Use it whenever you design, explain or build a system's components, and keep it current as work progresses (status: planned → building → done).
-ops:
-- get: current diagram as JSON. Call before answering questions about the diagram or editing it.
-- set: replace the whole diagram (title, nodes, edges).
-- patch: incremental edit. nodes upsert by id (fields merge), edges upsert by from→to, removeNodes (drops their edges), removeEdges.
-- list: diagram names in this repository. open: switch the pane to a diagram (created empty if new). delete: remove one.
-Edges point from caller to callee / producer to consumer. Keep labels short; ids stable. In a patch, a field set to "" is cleared.
-A node's detail names a subdiagram of what happens inside it: clicking the box opens it, and a breadcrumb leads back. Draw each detail diagram you link.
-The user can click a box (or pick "Ask about this" from its right-click menu) to put [diagram <name>: <id>] in their prompt: that names a component, look it up with get.`
-
-type Input = Patch & { op: string; name?: string; diagram?: Diagram }
 
 // ponytail: $.store is one file per user, keyed here by repo root; last write wins across concurrent sessions.
 const keyOf = async ($: EngineInterface, name: string) => `diagram:${await $.session.root()}:${name}`
@@ -74,7 +41,9 @@ async function show($: EngineInterface, cur: Current, above: string[] = [], save
 // The engine refuses canvas data or a drawn tree past 100,000 characters; the estimate
 // runs high (measured: ~108k still drew, ~134k didn't), so this only refuses what it would.
 const DRAW_LIMIT = { data: 90_000, tree: 100_000 }
-const toDraw = (d: Diagram) => toDrawing(layout(d), s => (s === undefined ? undefined : COLOR[s as Status]))
+// An edit is checked at a wide pane's width: the widest window draws the most.
+const WIDE_PANE = 110
+const toDraw = (l: Layout) => toDrawing(l, s => s && COLOR[s])
 const tooBig = (drawing: Drawing, cols: number) => {
   const size = drawnSize(drawing, cols)
   return size.data > DRAW_LIMIT.data || size.tree > DRAW_LIMIT.tree
@@ -98,8 +67,8 @@ const edited = (input: Input, base: Diagram): Diagram =>
  * the pane and unsaved. `call.shown` is what was drawn last, so only a change redraws.
  */
 async function preview($: EngineInterface, call: { json: string; shown: string }) {
-  const input = partialJson(call.json) as Input | undefined
-  if (input?.op !== 'set' && input?.op !== 'patch') return
+  const input = readInput(partialJson(call.json))
+  if (typeof input === 'string' || (input.op !== 'set' && input.op !== 'patch')) return
   const name = input.name?.trim() || (await read($, current))?.name || DEFAULT
   let diagram: Diagram
   try {
@@ -119,24 +88,7 @@ async function preview($: EngineInterface, call: { json: string; shown: string }
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'diagram', description: 'Open the architecture diagram pane: /diagram [name]' })
-    await $.tool.register({
-      name: 'diagram',
-      description: DESCRIPTION,
-      inputSchema: {
-        type: 'object',
-        properties: {
-          op: { type: 'string', enum: ['get', 'set', 'patch', 'list', 'open', 'delete'] },
-          name: { type: 'string', description: `Diagram name; defaults to the open one, else "${DEFAULT}"` },
-          title: { type: 'string' },
-          diagram: { type: 'object', properties: { title: { type: 'string' }, nodes: { type: 'array', items: node }, edges: { type: 'array', items: edge } } },
-          nodes: { type: 'array', items: node },
-          removeNodes: { type: 'array', items: { type: 'string' } },
-          edges: { type: 'array', items: edge },
-          removeEdges: { type: 'array', items: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' } } } },
-        },
-        required: ['op'],
-      },
-    })
+    await $.tool.register({ name: 'diagram', description: DESCRIPTION, inputSchema: INPUT_SCHEMA })
     if ((await read($, current)) === null) {
       const last = (await $.store.get(await lastKey($))) as string | undefined
       if (last !== undefined) {
@@ -156,16 +108,14 @@ export const register: Register = on => {
     }
     const cur = await read($, current)
     const next = asked !== '' && asked !== cur?.name ? await load($, asked) : (cur ?? (await load($, DEFAULT)))
-    await update($, trail, () => [])
-    await update($, current, () => next)
-    await $.store.set(await lastKey($), next.name)
-    await $.ui.open({ id: PANE, title: `Diagram: ${next.name}` })
+    await show($, next, [], false)
 
     return { text: `Diagram "${next.name}" opened (${plural(next.diagram.nodes.length, 'component')}).` }
   })
 
   on('tool.call', { tool: TOOL }, async ($, e) => {
-    const input = e as unknown as Input
+    const input = readInput(e)
+    if (typeof input === 'string') return { deny: `diagram not changed: ${input}` }
     const open = await read($, current)
     const name = input.name?.trim() || open?.name || DEFAULT
     // From the store, not the pane: the pane may hold this call's unsaved preview.
@@ -195,7 +145,7 @@ export const register: Register = on => {
         const problem = check(diagram)
         if (problem !== undefined) return { deny: `diagram not changed: ${problem}` }
         const l = layout(diagram)
-        if (tooBig(toDraw(diagram), 110)) {
+        if (tooBig(toDraw(l), WIDE_PANE)) {
           return {
             deny: `diagram not changed: it lays out to ${l.width}×${l.height}, too large to draw in the pane. Split it into an overview and detail diagrams linked with "detail" (see the drawing-pane-diagrams skill).`,
           }
@@ -316,7 +266,7 @@ export const register: Register = on => {
 
     const l = layout(cur.diagram)
     const cols = e.props.bodyColumns
-    const drawing = toDraw(cur.diagram)
+    const drawing = toDraw(l)
     if (tooBig(drawing, cols)) {
       return (
         <Box flexDirection="column">
@@ -329,17 +279,15 @@ export const register: Register = on => {
     }
     const isWide = l.width > cols
     // Terminal and desktop pan with the pointer through a Client; the rest draw it still.
-    const body =
-      e.surface === 'terminal' || e.surface === 'desktop' ? (
-        (() => {
-          const { Client } = $.ui.resolve(e)
-          // Room under a small diagram for a box's right-click menu.
-          const regionRows = Math.max(l.height, 10)
-          return <Client key="canvas" module="./canvas.tsx" props={{ ...drawing, cols, regionRows, name: cur.name }} width={cols} height={regionRows} />
-        })()
-      ) : (
-        draw({ Box, Text }, drawing, 0, cols)
-      )
+    // A small diagram's region keeps room under it for a box's right-click menu.
+    const regionRows = Math.max(l.height, 10)
+    let body
+    if (e.surface === 'terminal' || e.surface === 'desktop') {
+      const { Client } = $.ui.resolve(e)
+      body = <Client key="canvas" module="./canvas.tsx" props={{ ...drawing, cols, regionRows, name: cur.name }} width={cols} height={regionRows} />
+    } else {
+      body = draw({ Box, Text }, drawing, 0, cols)
+    }
 
     // Back up the breadcrumb: crumb `i` becomes the open diagram, what was above it stays above.
     const back = async (i: number) => {

@@ -107,13 +107,17 @@ const D_GAP = 2
 const MIN_W = 10
 const MAX_W = 26
 const SWEEPS = 24
+// Rounds of re-placing ranks after a group moves, and of pulling x toward neighbors:
+// both settle in a few on the diagram sizes the caps allow.
+const SETTLE_ROUNDS = 8
+const X_PASSES = 4
 // A group's border column, then a blank one, on each side of its members.
 const G_PAD = 2
 // Joins a group's name to the index of one of its runs of ranks.
 const RUN = '\u0001'
 
-export type Placed = { node: DiagramNode; x: number; y: number; w: number; label: string; sub: string }
-export type GroupRect = { name: string; x: number; y: number; w: number; h: number }
+type Placed = { node: DiagramNode; x: number; y: number; w: number; label: string; sub: string }
+type GroupRect = { name: string; x: number; y: number; w: number; h: number }
 export type Layout = { width: number; height: number; boxes: Placed[]; groups: GroupRect[]; rows: string[] }
 
 // Terminal cells: a wide character (CJK, most emoji) takes two, the second held by ''.
@@ -200,29 +204,33 @@ function rank(d: Diagram, edges: Oriented[]): Map<string, number> {
   return r
 }
 
-const U = 1, D = 2, L = 4, R = 8
-const GLYPH: Record<number, string> = {
-  [U]: '│', [D]: '│', [U | D]: '│', [L]: '─', [R]: '─', [L | R]: '─',
-  [D | R]: '╭', [D | L]: '╮', [U | R]: '╰', [U | L]: '╯',
-  [U | D | R]: '├', [U | D | L]: '┤', [D | L | R]: '┬', [U | L | R]: '┴', [U | D | L | R]: '┼',
-}
-
 /** A box, or a waypoint (no node) a long edge passes through on its way down. */
 type Item = { node?: DiagramNode; group?: string; rank: number; w: number; label: string; sub: string }
 /** One hop of an edge between adjacent ranks, item `a` above `b`. */
-type Seg = { a: number; b: number; edge: DiagramEdge; rev: boolean; first: boolean; last: boolean }
+type Hop = { a: number; b: number; edge: DiagramEdge; rev: boolean; first: boolean; last: boolean }
 
 /**
- * A layered (Sugiyama-style) layout in terminal cells: ranks top-down, edges
- * that skip ranks broken into waypoints, ranks ordered by barycenter sweeps
- * keeping the order with the fewest crossings, x pulled toward neighbors, and
- * every hop routed orthogonally through the gap below its rank.
+ * The ranked graph every layout phase reads: boxes then waypoints, the hops between
+ * them, and both indexed once. Item and hop numbers are indexes into `items` and `hops`.
  */
-export function layout(d: Diagram): Layout {
-  if (d.nodes.length === 0) return { width: 0, height: 0, boxes: [], groups: [], rows: [] }
+type Graph = {
+  items: Item[]
+  hops: Hop[]
+  depth: number
+  /** Per item: the items one rank up / down that a hop links it to. */
+  ups: number[][]
+  downs: number[][]
+  /** Per item: the hops leaving it downward / arriving from above. */
+  outs: number[][]
+  ins: number[][]
+  /** Per rank: the hops in the gap below it. */
+  below: number[][]
+}
+
+function build(d: Diagram): Graph {
   const edges = orient(d)
   const ranks = rank(d, edges)
-  const depth = d.nodes.length === 0 ? 0 : Math.max(...ranks.values()) + 1
+  const depth = Math.max(...ranks.values()) + 1
 
   const items: Item[] = d.nodes.map(n => {
     const sub = [n.kind, n.status].filter(Boolean).join(' · ')
@@ -234,73 +242,86 @@ export function layout(d: Diagram): Layout {
     return { node: n, group: n.group || undefined, rank: ranks.get(n.id)!, w, label, sub: clip(sub, w - 4) }
   })
   const itemOf = new Map(d.nodes.map((n, i) => [n.id, i]))
-  const segs: Seg[] = []
+  const hops: Hop[] = []
   for (const e of edges) {
-    let prev = itemOf.get(e.u)!
-    const end = itemOf.get(e.v)!
+    const start = itemOf.get(e.u)!, end = itemOf.get(e.v)!
     // A waypoint is inside a group only when both ends are.
-    const group = items[prev]!.group === items[end]!.group ? items[end]!.group : undefined
-    for (let r = items[prev]!.rank + 1; r <= items[end]!.rank; r++) {
+    const group = items[start]!.group === items[end]!.group ? items[end]!.group : undefined
+    let prev = start
+    for (let r = items[start]!.rank + 1; r <= items[end]!.rank; r++) {
       const next = r === items[end]!.rank ? end : items.push({ group, rank: r, w: 1, label: '', sub: '' }) - 1
-      segs.push({ a: prev, b: next, edge: e.edge, rev: e.rev, first: r === items[itemOf.get(e.u)!]!.rank + 1, last: next === end })
+      hops.push({ a: prev, b: next, edge: e.edge, rev: e.rev, first: prev === start, last: next === end })
       prev = next
     }
   }
 
-  const ups: number[][] = items.map(() => [])
-  const downs: number[][] = items.map(() => [])
-  for (const s of segs) {
-    ups[s.b]!.push(s.a)
-    downs[s.a]!.push(s.b)
+  const perItem = () => items.map(() => [] as number[])
+  const ups = perItem(), downs = perItem(), outs = perItem(), ins = perItem()
+  const below = Array.from({ length: depth }, () => [] as number[])
+  hops.forEach((h, k) => {
+    ups[h.b]!.push(h.a)
+    downs[h.a]!.push(h.b)
+    outs[h.a]!.push(k)
+    ins[h.b]!.push(k)
+    below[items[h.a]!.rank]!.push(k)
+  })
+
+  return { items, hops, depth, ups, downs, outs, ins, below }
+}
+
+/**
+ * Crossings between adjacent ranks: the inversions of each gap's hops' (top, bottom)
+ * positions. Sorted by top, count the earlier hops ending further right with a
+ * Fenwick tree over bottom positions: O(E log E) per gap.
+ */
+function crossings(g: Graph, posOf: number[]): number {
+  let total = 0
+  for (const ks of g.below) {
+    const pairs = ks.map(k => [posOf[g.hops[k]!.a]!, posOf[g.hops[k]!.b]!] as const).sort((p, q) => p[0] - q[0] || p[1] - q[1])
+    const size = pairs.reduce((m, p) => Math.max(m, p[1]), 0) + 2
+    const tree = new Array<number>(size + 1).fill(0)
+    const add = (pos: number) => {
+      for (let i = pos + 1; i <= size; i += i & -i) tree[i]!++
+    }
+    const countUpTo = (pos: number) => {
+      let n = 0
+      for (let i = pos + 1; i > 0; i -= i & -i) n += tree[i]!
+      return n
+    }
+    let seen = 0
+    for (let i = 0; i < pairs.length; ) {
+      let j = i
+      while (j < pairs.length && pairs[j]![0] === pairs[i]![0]) j++
+      // Hops from the same top never cross each other: count the whole run, then add it.
+      for (let k = i; k < j; k++) total += seen - countUpTo(pairs[k]![1])
+      for (let k = i; k < j; k++) add(pairs[k]![1])
+      seen += j - i
+      i = j
+    }
   }
 
-  // Order within ranks: alternate down and up barycenter sweeps, keep the best.
-  let layers: number[][] = Array.from({ length: depth }, () => [])
-  items.forEach((it, i) => layers[it.rank]!.push(i))
-  const posOf: number[] = new Array(items.length).fill(0)
+  return total
+}
+
+/** Orders each rank: alternate down and up barycenter sweeps, keep the order with the fewest crossings. */
+function orderRanks(g: Graph): { layers: number[][]; posOf: number[] } {
+  let layers: number[][] = Array.from({ length: g.depth }, () => [])
+  g.items.forEach((item, it) => layers[item.rank]!.push(it))
+  const posOf: number[] = new Array(g.items.length).fill(0)
   const index = () => layers.forEach(l => l.forEach((it, i) => (posOf[it] = i)))
-  const segsBelow: Seg[][] = Array.from({ length: depth }, () => [])
-  const hopsBelow: number[][] = Array.from({ length: depth }, () => [])
-  segs.forEach((s, k) => {
-    segsBelow[items[s.a]!.rank]!.push(s)
-    hopsBelow[items[s.a]!.rank]!.push(k)
-  })
-  // Crossings between two adjacent ranks are the inversions of their hops' (top, bottom)
-  // positions: sorted by top, count earlier hops ending further right (O(E log E) per gap).
-  const crossings = () => {
-    let c = 0
-    for (const ss of segsBelow) {
-      const pairs = ss.map(s => [posOf[s.a]!, posOf[s.b]!] as const).sort((p, q) => p[0] - q[0] || p[1] - q[1])
-      const n = pairs.reduce((m, p) => Math.max(m, p[1]), 0) + 2
-      const tree = new Array<number>(n + 1).fill(0)
-      const add = (i: number) => { for (i++; i <= n; i += i & -i) tree[i]!++ }
-      const upTo = (i: number) => { let t = 0; for (i++; i > 0; i -= i & -i) t += tree[i]!; return t }
-      let seen = 0
-      for (let i = 0; i < pairs.length; ) {
-        let j = i
-        while (j < pairs.length && pairs[j]![0] === pairs[i]![0]) j++
-        // Hops from the same top never cross each other: count the group, then add it.
-        for (let k = i; k < j; k++) c += seen - upTo(pairs[k]![1])
-        for (let k = i; k < j; k++) add(pairs[k]![1])
-        seen += j - i
-        i = j
-      }
-    }
-    return c
-  }
   index()
-  let best = crossings()
+  let best = crossings(g, posOf)
   let bestLayers = layers.map(l => [...l])
   for (let sweep = 0; sweep < SWEEPS && best > 0; sweep++) {
     const down = sweep % 2 === 0
-    const nb = down ? ups : downs
-    for (let k = 1; k < depth; k++) {
-      const r = down ? k : depth - 1 - k
+    const nb = down ? g.ups : g.downs
+    for (let k = 1; k < g.depth; k++) {
+      const r = down ? k : g.depth - 1 - k
       const bary = new Map(layers[r]!.map(it => [it, nb[it]!.length > 0 ? avg(nb[it]!.map(n => posOf[n]!)) : posOf[it]!]))
       layers[r] = [...layers[r]!].sort((p, q) => bary.get(p)! - bary.get(q)!)
       layers[r]!.forEach((it, i) => (posOf[it] = i))
     }
-    const c = crossings()
+    const c = crossings(g, posOf)
     if (c < best) {
       best = c
       bestLayers = layers.map(l => [...l])
@@ -309,56 +330,87 @@ export function layout(d: Diagram): Layout {
   layers = bestLayers
   index()
 
-  // Groups: members sit in one block per rank, blocks in one global left-to-right order
-  // (by where the sweeps put their members), and each group owns one column range on
-  // every rank it spans, so its border holds its members and nothing else.
-  // A group whose members skip ranks is drawn as one border per run of consecutive ranks:
-  // one rectangle over the gap would wall off every rank in between.
-  // Runs come from ranks holding member boxes; a waypoint outside every run is outside.
-  const runOf = new Map<string, number[]>()
-  for (const it of items) if (it.group && it.node) runOf.set(it.group, [...(runOf.get(it.group) ?? []), it.rank])
-  for (const [g, rs] of runOf) {
+  return { layers, posOf }
+}
+
+/** One slot of a rank, left to right: a lone item, or a group's block of members. */
+type Entry = { item: number } | { group: string; members: number[] }
+/** Groups as blocks: each run's first and last rank, and every rank's slots in order. */
+type Blocks = { runs: string[]; span: Map<string, [number, number]>; entries: Entry[][] }
+
+const groupName = (run: string) => run.split(RUN)[0]!
+
+/**
+ * Groups: members sit in one block per rank, blocks in one global left-to-right order
+ * (by where the sweeps put their members), and each group owns one column range on
+ * every rank it spans, so its border holds its members and nothing else.
+ * A group whose members skip ranks is drawn as one border per run of consecutive ranks:
+ * one rectangle over the gap would wall off every rank in between. So each item's
+ * `group` becomes its run (`name RUN index`); a waypoint outside every run is outside.
+ */
+function blockGroups(g: Graph, layers: number[][], posOf: number[]): Blocks {
+  const { items } = g
+  const ranksOf = new Map<string, number[]>()
+  for (const item of items) if (item.group && item.node) ranksOf.set(item.group, [...(ranksOf.get(item.group) ?? []), item.rank])
+  for (const [name, rs] of ranksOf) {
     const sorted = [...new Set(rs)].sort((a, b) => a - b)
-    const run = new Map<number, number>()
-    sorted.forEach((r, i) => run.set(r, i > 0 && r === sorted[i - 1]! + 1 ? run.get(sorted[i - 1]!)! : i))
-    for (const it of items) {
-      if (it.group !== g) continue
-      it.group = run.has(it.rank) ? `${g}${RUN}${run.get(it.rank)}` : undefined
+    const runAt = new Map<number, number>()
+    sorted.forEach((r, i) => runAt.set(r, i > 0 && r === sorted[i - 1]! + 1 ? runAt.get(sorted[i - 1]!)! : i))
+    for (const item of items) {
+      if (item.group !== name) continue
+      item.group = runAt.has(item.rank) ? `${name}${RUN}${runAt.get(item.rank)}` : undefined
     }
   }
-  const names = [...new Set(items.flatMap(it => (it.group ? [it.group] : [])))]
-  const span = new Map(names.map(g => [g, [Infinity, -Infinity] as [number, number]]))
-  for (const it of items) {
-    if (!it.group) continue
-    const sp = span.get(it.group)!
-    sp[0] = Math.min(sp[0], it.rank)
-    sp[1] = Math.max(sp[1], it.rank)
+
+  const runs = [...new Set(items.flatMap(item => (item.group ? [item.group] : [])))]
+  const span = new Map(runs.map(run => [run, [Infinity, -Infinity] as [number, number]]))
+  for (const item of items) {
+    if (!item.group) continue
+    const sp = span.get(item.group)!
+    sp[0] = Math.min(sp[0], item.rank)
+    sp[1] = Math.max(sp[1], item.rank)
   }
-  const npos = (it: number) => (posOf[it]! + 0.5) / layers[items[it]!.rank]!.length
-  const gkey = new Map(names.map(g => [g, avg(items.flatMap((it, i) => (it.group === g ? [npos(i)] : [])))]))
-  type Entry = { item: number } | { group: string; members: number[] }
+  // Where an item sits across its rank, 0..1, so ranks of different sizes compare.
+  const across = (it: number) => (posOf[it]! + 0.5) / layers[items[it]!.rank]!.length
+  const runOrder = new Map(runs.map(run => [run, avg(items.flatMap((item, it) => (item.group === run ? [across(it)] : [])))]))
   const entries: Entry[][] = layers.map((l, r) => {
-    const keyed: [number, number, Entry][] = l.filter(it => !items[it]!.group).map(it => [npos(it), 0, { item: it }])
-    for (const g of names) {
-      const [a, b] = span.get(g)!
-      if (r >= a && r <= b) keyed.push([gkey.get(g)!, 1, { group: g, members: l.filter(it => items[it]!.group === g) }])
+    const keyed: [number, number, Entry][] = l.filter(it => !items[it]!.group).map(it => [across(it), 0, { item: it }])
+    for (const run of runs) {
+      const [a, b] = span.get(run)!
+      if (r >= a && r <= b) keyed.push([runOrder.get(run)!, 1, { group: run, members: l.filter(it => items[it]!.group === run) }])
     }
     return keyed.sort((p, q) => p[0] - q[0] || p[1] - q[1]).map(k => k[2])
   })
 
-  // x: pack each rank, then pull every item toward its neighbors' centers, keeping order,
-  // spacing and every group's column range.
+  return { runs, span, entries }
+}
+
+const centerOf = (item: Item, x: number) => x + Math.floor(item.w / 2)
+
+/**
+ * x: pack each rank, then pull every item toward its neighbors' centers, keeping order,
+ * spacing and every group's column range. Item and group x end up starting at 0.
+ */
+function placeX(g: Graph, { runs, entries }: Blocks) {
+  const { items, depth, ups, downs } = g
   const xs: number[] = new Array(items.length).fill(0)
   const gap = (p: number, q: number) => (items[p]!.node && items[q]!.node ? H_GAP : D_GAP)
-  const cx = (it: number) => xs[it]! + Math.floor(items[it]!.w / 2)
-  const packed = (ms: number[]) => ms.reduce((a, it, i) => a + items[it]!.w + (i > 0 ? gap(ms[i - 1]!, it) : 0), 0)
-  const gw = new Map(names.map(g => {
-    const widest = Math.max(0, ...entries.flatMap(es => es.flatMap(e => ('group' in e && e.group === g ? [packed(e.members)] : []))))
-    return [g, Math.max(textWidth(g.split(RUN)[0]!) + 6, widest + 2 * G_PAD)]
+  const cx = (it: number) => centerOf(items[it]!, xs[it]!)
+  const packedWidth = (ms: number[]) => ms.reduce((a, it, i) => a + items[it]!.w + (i > 0 ? gap(ms[i - 1]!, it) : 0), 0)
+  const gw = new Map(runs.map(run => {
+    const widest = Math.max(0, ...entries.flatMap(es => es.flatMap(e => ('group' in e && e.group === run ? [packedWidth(e.members)] : []))))
+    return [run, Math.max(textWidth(groupName(run)) + 6, widest + 2 * G_PAD)]
   }))
-  const gx = new Map(names.map(g => [g, 0]))
+  const gx = new Map(runs.map(run => [run, 0]))
   const after = (e: Entry, next: Entry | undefined) =>
     next === undefined ? 0 : 'item' in e && 'item' in next ? gap(e.item, next.item) : H_GAP
+  // Lays items out left to right from `start`, each where it wants or right after the
+  // one before; returns where the last one ends.
+  const pack = (ms: number[], start: number, want: (it: number) => number) =>
+    ms.reduce((x, it, j) => {
+      xs[it] = Math.max(Math.round(want(it)), x)
+      return xs[it]! + items[it]!.w + (j + 1 < ms.length ? gap(it, ms[j + 1]!) : 0)
+    }, start)
   const placeRank = (es: Entry[], want: (it: number) => number) => {
     let min = -Infinity
     es.forEach((e, i) => {
@@ -370,242 +422,301 @@ export function layout(d: Diagram): Layout {
       // A group only moves right here; its range is the same on every rank.
       gx.set(e.group, Math.max(gx.get(e.group)!, min))
       const left = gx.get(e.group)!, right = left + gw.get(e.group)! - G_PAD
-      let inner = left + G_PAD
-      e.members.forEach((it, j) => {
-        xs[it] = Math.max(Math.round(want(it)), inner)
-        inner = xs[it]! + items[it]!.w + (j + 1 < e.members.length ? gap(it, e.members[j + 1]!) : 0)
-      })
-      if (inner > right) {
-        let c = left + G_PAD
-        e.members.forEach((it, j) => {
-          xs[it] = c
-          c += items[it]!.w + (j + 1 < e.members.length ? gap(it, e.members[j + 1]!) : 0)
-        })
-      }
+      // Members that don't fit where they want are packed tight from the left border.
+      if (pack(e.members, left + G_PAD, want) > right) pack(e.members, left + G_PAD, () => -Infinity)
       min = left + gw.get(e.group)! + after(e, es[i + 1])
     })
   }
   // A group pushed right on one rank must be placed again on the ranks done before.
   const settle = () => {
-    for (let i = 0; i < 8; i++) {
-      const before = names.map(g => gx.get(g))
+    for (let i = 0; i < SETTLE_ROUNDS; i++) {
+      const before = runs.map(run => gx.get(run))
       for (const es of entries) placeRank(es, it => xs[it]!)
-      if (names.every((g, j) => gx.get(g) === before[j])) return
+      if (runs.every((run, j) => gx.get(run) === before[j])) return
     }
   }
+
   for (const es of entries) placeRank(es, () => 0)
   settle()
-  for (let pass = 0; pass < 4; pass++) {
-    const nb = pass % 2 === 0 ? ups : downs
+  for (let pass = 0; pass < X_PASSES; pass++) {
+    const down = pass % 2 === 0
+    const nb = down ? ups : downs
     const want = (it: number) => (nb[it]!.length > 0 ? avg(nb[it]!.map(cx)) - Math.floor(items[it]!.w / 2) : xs[it]!)
     // Each group starts the pass where its members, on average, want it.
-    for (const g of names) {
-      const ms = items.flatMap((it, i) => (it.group === g ? [i] : []))
-      gx.set(g, Math.round(avg(ms.map(m => want(m) - xs[m]!))) + gx.get(g)!)
+    for (const run of runs) {
+      const ms = items.flatMap((item, it) => (item.group === run ? [it] : []))
+      gx.set(run, Math.round(avg(ms.map(m => want(m) - xs[m]!))) + gx.get(run)!)
     }
-    for (let k = 1; k < depth; k++) placeRank(entries[pass % 2 === 0 ? k : depth - 1 - k]!, want)
-    placeRank(entries[pass % 2 === 0 ? 0 : depth - 1]!, it => xs[it]!)
+    for (let k = 1; k < depth; k++) placeRank(entries[down ? k : depth - 1 - k]!, want)
+    placeRank(entries[down ? 0 : depth - 1]!, it => xs[it]!)
     settle()
   }
+
   let minX = Infinity
   for (const x of xs) minX = Math.min(minX, x)
-  for (const g of names) minX = Math.min(minX, gx.get(g)!)
+  for (const run of runs) minX = Math.min(minX, gx.get(run)!)
   for (let i = 0; i < xs.length; i++) xs[i] = xs[i]! - minX
-  for (const g of names) gx.set(g, gx.get(g)! - minX)
+  for (const run of runs) gx.set(run, gx.get(run)! - minX)
   let width = 0
-  items.forEach((it, i) => (width = Math.max(width, xs[i]! + it.w)))
-  for (const g of names) width = Math.max(width, gx.get(g)! + gw.get(g)!)
+  items.forEach((item, it) => (width = Math.max(width, xs[it]! + item.w)))
+  for (const run of runs) width = Math.max(width, gx.get(run)! + gw.get(run)!)
 
-  // Ports: a box spreads its hops across its width, ordered by where the other end is.
-  const outPort: number[] = new Array(segs.length).fill(0)
-  const inPort: number[] = new Array(segs.length).fill(0)
+  return { xs, gx, gw, width }
+}
+
+/** Per hop: the column it leaves its upper item from and the one it enters its lower item at. */
+type Ports = { outPort: number[]; inPort: number[] }
+
+/** A box spreads its hops across its width, ordered by where the other end is. */
+function routePorts(g: Graph, xs: number[]): Ports {
+  const { items, hops, ups, downs, outs, ins } = g
+  const cx = (it: number) => centerOf(items[it]!, xs[it]!)
+  const outPort: number[] = new Array(hops.length).fill(0)
+  const inPort: number[] = new Array(hops.length).fill(0)
   const spread = (it: number, ks: number[], other: (k: number) => number, port: number[]) => {
     const { w, node } = items[it]!
     ;[...ks].sort((p, q) => other(p) - other(q)).forEach((k, i, all) => {
       port[k] = node ? Math.max(xs[it]! + 2, Math.min(xs[it]! + w - 3, xs[it]! + Math.round(((i + 1) * w) / (all.length + 1)))) : xs[it]!
     })
   }
-  const outsOf: number[][] = items.map(() => [])
-  const insOf: number[][] = items.map(() => [])
-  segs.forEach((s, k) => {
-    outsOf[s.a]!.push(k)
-    insOf[s.b]!.push(k)
-  })
   items.forEach((_, it) => {
-    spread(it, outsOf[it]!, k => cx(segs[k]!.b), outPort)
-    spread(it, insOf[it]!, k => cx(segs[k]!.a), inPort)
+    spread(it, outs[it]!, k => cx(hops[k]!.b), outPort)
+    spread(it, ins[it]!, k => cx(hops[k]!.a), inPort)
   })
   // A box's only hop goes straight when the other end's port lands on that box anyway.
   const onBox = (it: number, x: number) => items[it]!.node !== undefined && x >= xs[it]! + 2 && x <= xs[it]! + items[it]!.w - 3
-  segs.forEach((s, k) => {
-    if (ups[s.b]!.length === 1 && onBox(s.b, outPort[k]!)) inPort[k] = outPort[k]!
-    else if (downs[s.a]!.length === 1 && onBox(s.a, inPort[k]!)) outPort[k] = inPort[k]!
+  hops.forEach((h, k) => {
+    if (ups[h.b]!.length === 1 && onBox(h.b, outPort[k]!)) inPort[k] = outPort[k]!
+    else if (downs[h.a]!.length === 1 && onBox(h.a, inPort[k]!)) outPort[k] = inPort[k]!
   })
 
-  // Lanes: each bent hop gets a horizontal track in its gap. Where one hop drops into
-  // the column another starts from, the starting one must turn first (a lane above),
-  // or the two would share a vertical. Within that order, tracks pack where runs don't touch.
-  const lane: number[] = new Array(segs.length).fill(-1)
-  const gapH: number[] = new Array(Math.max(0, depth - 1)).fill(2)
-  hopsBelow.forEach((ks, g) => {
-    if (g >= depth - 1) return
+  return { outPort, inPort }
+}
+
+/**
+ * Lanes: each bent hop gets a horizontal track in its gap (-1: it runs straight). Where
+ * one hop drops into the column another starts from, the starting one must turn first
+ * (a lane above), or the two would share a vertical. Within that order, tracks pack
+ * where runs don't touch. Also returns each gap's height in rows, before group borders.
+ */
+function assignLanes(g: Graph, { outPort, inPort }: Ports): { lane: number[]; gapH: number[] } {
+  const lane: number[] = new Array(g.hops.length).fill(-1)
+  const gapH: number[] = new Array(g.depth - 1).fill(2)
+  g.below.forEach((ks, gi) => {
+    if (gi >= g.depth - 1) return
     const bent = ks.filter(k => outPort[k] !== inPort[k])
     const lo = (k: number) => Math.min(outPort[k]!, inPort[k]!)
     const hi = (k: number) => Math.max(outPort[k]!, inPort[k]!)
-    const above = new Map(bent.map(k => [k, bent.filter(o => o !== k && inPort[k] === outPort[o])]))
+    const turnsFirst = new Map(bent.map(k => [k, bent.filter(o => o !== k && inPort[k] === outPort[o])]))
     const tracks: number[][] = []
-    const left = new Set(bent)
-    while (left.size > 0) {
-      const ready = [...left].filter(k => above.get(k)!.every(o => !left.has(o)))
+    const pending = new Set(bent)
+    while (pending.size > 0) {
+      const ready = [...pending].filter(k => turnsFirst.get(k)!.every(o => !pending.has(o)))
       // A cycle of such drops can't all be untangled: take the leftmost and accept the overlap.
-      const k = (ready.length > 0 ? ready : [...left]).sort((p, q) => lo(p) - lo(q))[0]!
-      left.delete(k)
-      let at = Math.max(0, ...above.get(k)!.filter(o => lane[o] !== -1).map(o => lane[o]! + 1))
+      const k = (ready.length > 0 ? ready : [...pending]).sort((p, q) => lo(p) - lo(q))[0]!
+      pending.delete(k)
+      let at = Math.max(0, ...turnsFirst.get(k)!.filter(o => lane[o] !== -1).map(o => lane[o]! + 1))
       while (tracks[at]?.some(o => !(hi(o) + 1 < lo(k) || hi(k) + 1 < lo(o)))) at++
       ;(tracks[at] ??= []).push(k)
       lane[k] = at
     }
-    gapH[g] = Math.max(2, tracks.length + 2)
-  })
-  // A gap where a group ends gets its bottom border under the stub row; one where a group
-  // starts gets its top border over the arrow row. The outer ranks get margins for them.
-  const endsAt = (r: number) => names.some(g => span.get(g)![1] === r)
-  const startsAt = (r: number) => names.some(g => span.get(g)![0] === r)
-  for (let g = 0; g < depth - 1; g++) gapH[g] = gapH[g]! + (endsAt(g) ? 1 : 0) + (startsAt(g + 1) ? 1 : 0)
-  const rankY: number[] = [depth > 0 && startsAt(0) ? 2 : 0]
-  for (let r = 1; r < depth; r++) rankY.push(rankY[r - 1]! + BOX_H + gapH[r - 1]!)
-  const height = depth === 0 ? 0 : rankY[depth - 1]! + BOX_H + (endsAt(depth - 1) ? 2 : 0)
-  const groups: GroupRect[] = names.map(g => {
-    const [a, b] = span.get(g)!
-    const y = rankY[a]! - 2
-    return { name: g.split(RUN)[0]!, x: gx.get(g)!, y, w: gw.get(g)!, h: rankY[b]! + BOX_H + 2 - y }
+    gapH[gi] = Math.max(2, tracks.length + 2)
   })
 
-  const mask = new Uint8Array(width * height)
-  const overlay = new Map<number, string>()
-  const put = (x: number, y: number, bits: number) => {
-    if (x >= 0 && x < width && y >= 0 && y < height) mask[y * width + x]! |= bits
-  }
-  const seg = (x0: number, y0: number, x1: number, y1: number) => {
-    if (x0 === x1) {
-      const [a, b] = y0 < y1 ? [y0, y1] : [y1, y0]
-      for (let y = a; y <= b; y++) put(x0, y, (y > a ? U : 0) | (y < b ? D : 0))
-    } else {
-      const [a, b] = x0 < x1 ? [x0, x1] : [x1, x0]
-      for (let x = a; x <= b; x++) put(x, y0, (x > a ? L : 0) | (x < b ? R : 0))
-    }
-  }
-  const top = (k: number) => rankY[items[segs[k]!.a]!.rank]! + BOX_H
-  const bottom = (k: number) => rankY[items[segs[k]!.b]!.rank]! - 1
-  const laneY = (k: number) => top(k) + 1 + (endsAt(items[segs[k]!.a]!.rank) ? 1 : 0) + lane[k]!
+  return { lane, gapH }
+}
 
-  items.forEach((it, i) => {
-    if (!it.node) for (let y = rankY[it.rank]!; y < rankY[it.rank]! + BOX_H; y++) put(xs[i]!, y, U | D)
-  })
-  segs.forEach((s, k) => {
-    const px = outPort[k]!, qx = inPort[k]!, y0 = top(k), y1 = bottom(k)
-    const pts: [number, number][] = [[px, y0]]
-    if (lane[k] !== -1) pts.push([px, laneY(k)], [qx, laneY(k)])
-    pts.push([qx, y1])
-    put(px, y0, U)
-    for (let i = 1; i < pts.length; i++) seg(...pts[i - 1]!, ...pts[i]!)
-    if (!items[s.b]!.node) put(qx, y1, D)
-    if (s.last && !s.rev) overlay.set(y1 * width + qx, '▼')
-    if (s.first && s.rev) overlay.set(y0 * width + px, '▲')
-  })
+/**
+ * y: a gap where a group ends gets its bottom border under the stub row; one where a
+ * group starts gets its top border over the arrow row. The outer ranks get margins for them.
+ */
+function placeY(g: Graph, { runs, span }: Blocks, gapH: number[]) {
+  const { depth } = g
+  const endsAt = (r: number) => runs.some(run => span.get(run)![1] === r)
+  const startsAt = (r: number) => runs.some(run => span.get(run)![0] === r)
+  const rankY: number[] = [startsAt(0) ? 2 : 0]
+  for (let r = 1; r < depth; r++) {
+    const gap = gapH[r - 1]! + (endsAt(r - 1) ? 1 : 0) + (startsAt(r) ? 1 : 0)
+    rankY.push(rankY[r - 1]! + BOX_H + gap)
+  }
+  const height = rankY[depth - 1]! + BOX_H + (endsAt(depth - 1) ? 2 : 0)
+  const groupEnds = rankY.map((_, r) => endsAt(r))
 
-  // Group borders sit in a mask of their own: an edge crossing one shows as a crossing.
-  const gmask = new Uint8Array(width * height)
-  const gput = (x: number, y: number, bits: number) => {
-    if (x >= 0 && x < width && y >= 0 && y < height) gmask[y * width + x]! |= bits
+  return { rankY, height, groupEnds }
+}
+
+/** Where a hop runs: down from (px, top), along its lane when it bends, down to (qx, bottom). */
+type Route = { px: number; qx: number; top: number; bottom: number; laneY: number | undefined }
+
+/**
+ * The cells everything but the boxes is drawn into: a bit mask of edge lines, one of
+ * group borders (so an edge crossing a border shows as a crossing), and text over both.
+ */
+type Grid = { width: number; height: number; lines: Uint8Array; borders: Uint8Array; text: Map<number, string> }
+
+const U = 1, D = 2, L = 4, R = 8
+const GLYPH: Record<number, string> = {
+  [U]: '│', [D]: '│', [U | D]: '│', [L]: '─', [R]: '─', [L | R]: '─',
+  [D | R]: '╭', [D | L]: '╮', [U | R]: '╰', [U | L]: '╯',
+  [U | D | R]: '├', [U | D | L]: '┤', [D | L | R]: '┬', [U | L | R]: '┴', [U | D | L | R]: '┼',
+}
+
+const cellAt = (grid: Grid, x: number, y: number) => y * grid.width + x
+const mark = (grid: Grid, mask: Uint8Array, x: number, y: number, dirs: number) => {
+  if (x >= 0 && x < grid.width && y >= 0 && y < grid.height) mask[cellAt(grid, x, y)]! |= dirs
+}
+/** A straight line from (x0, y0) to (x1, y1), its ends open toward the outside. */
+const stroke = (grid: Grid, mask: Uint8Array, x0: number, y0: number, x1: number, y1: number) => {
+  if (x0 === x1) {
+    const [a, b] = y0 < y1 ? [y0, y1] : [y1, y0]
+    for (let y = a; y <= b; y++) mark(grid, mask, x0, y, (y > a ? U : 0) | (y < b ? D : 0))
+  } else {
+    const [a, b] = x0 < x1 ? [x0, x1] : [x1, x0]
+    for (let x = a; x <= b; x++) mark(grid, mask, x, y0, (x > a ? L : 0) | (x < b ? R : 0))
   }
-  for (const g of groups) {
-    const x1 = g.x + g.w - 1, y1 = g.y + g.h - 1
-    for (let x = g.x; x <= x1; x++) {
-      gput(x, g.y, (x > g.x ? L : 0) | (x < x1 ? R : 0))
-      gput(x, y1, (x > g.x ? L : 0) | (x < x1 ? R : 0))
-    }
-    for (let y = g.y; y <= y1; y++) {
-      gput(g.x, y, (y > g.y ? U : 0) | (y < y1 ? D : 0))
-      gput(x1, y, (y > g.y ? U : 0) | (y < y1 ? D : 0))
-    }
+}
+const write = (grid: Grid, x: number, y: number, text: string) => cells(text).forEach((c, i) => grid.text.set(cellAt(grid, x + i, y), c))
+const isFree = (grid: Grid, x: number, y: number, n: number) =>
+  x + n <= grid.width &&
+  Array.from({ length: n }, (_, i) => cellAt(grid, x + i, y)).every(c => grid.lines[c] === 0 && grid.borders[c] === 0 && !grid.text.has(c))
+
+/** Every hop's line and arrowhead, and the line running through each waypoint's rank. */
+function drawHops(grid: Grid, g: Graph, routes: Route[], xs: number[], rankY: number[]) {
+  g.items.forEach((item, it) => {
+    if (!item.node) for (let y = rankY[item.rank]!; y < rankY[item.rank]! + BOX_H; y++) mark(grid, grid.lines, xs[it]!, y, U | D)
+  })
+  g.hops.forEach((h, k) => {
+    const { px, qx, top, bottom, laneY } = routes[k]!
+    const pts: [number, number][] = [[px, top]]
+    if (laneY !== undefined) pts.push([px, laneY], [qx, laneY])
+    pts.push([qx, bottom])
+    mark(grid, grid.lines, px, top, U)
+    for (let i = 1; i < pts.length; i++) stroke(grid, grid.lines, ...pts[i - 1]!, ...pts[i]!)
+    if (!g.items[h.b]!.node) mark(grid, grid.lines, qx, bottom, D)
+    if (h.last && !h.rev) grid.text.set(cellAt(grid, qx, bottom), '▼')
+    if (h.first && h.rev) grid.text.set(cellAt(grid, px, top), '▲')
+  })
+}
+
+/**
+ * Each group's border, and its name where no edge crosses its top border, else its
+ * bottom one, else over the top border's first crossings: a group must say what it is.
+ */
+function drawGroups(grid: Grid, groups: GroupRect[]) {
+  for (const rect of groups) {
+    const x1 = rect.x + rect.w - 1, y1 = rect.y + rect.h - 1
+    stroke(grid, grid.borders, rect.x, rect.y, x1, rect.y)
+    stroke(grid, grid.borders, rect.x, y1, x1, y1)
+    stroke(grid, grid.borders, rect.x, rect.y, rect.x, y1)
+    stroke(grid, grid.borders, x1, rect.y, x1, y1)
   }
-  // A group's name goes where no edge crosses its top border, else its bottom one, else
-  // over the top border's first crossings: a group must say what it is.
-  for (const g of groups) {
-    const text = cells(` ${clip(g.name, g.w - 6)} `)
-    const along = (y: number) =>
-      Array.from({ length: g.w - 3 - text.length }, (_, i) => g.x + 2 + i).find(x =>
-        text.every((_, i) => mask[y * width + x + i] === 0 && !overlay.has(y * width + x + i)),
+  for (const rect of groups) {
+    const text = cells(` ${clip(rect.name, rect.w - 6)} `)
+    const fitsAt = (y: number) =>
+      Array.from({ length: rect.w - 3 - text.length }, (_, i) => rect.x + 2 + i).find(x =>
+        text.every((_, i) => grid.lines[cellAt(grid, x + i, y)] === 0 && !grid.text.has(cellAt(grid, x + i, y))),
       )
-    const top = along(g.y), bottom = top === undefined ? along(g.y + g.h - 1) : undefined
-    const [x, y] = top !== undefined ? [top, g.y] : bottom !== undefined ? [bottom, g.y + g.h - 1] : [g.x + 2, g.y]
-    text.forEach((c, i) => overlay.set(y * width + x + i, c))
+    const top = fitsAt(rect.y), bottom = top === undefined ? fitsAt(rect.y + rect.h - 1) : undefined
+    const [x, y] = top !== undefined ? [top, rect.y] : bottom !== undefined ? [bottom, rect.y + rect.h - 1] : [rect.x + 2, rect.y]
+    text.forEach((c, i) => grid.text.set(cellAt(grid, x + i, y), c))
   }
+}
 
-  // Labels go on after every line: centered on a bent hop's run where it fits,
-  // else beside a vertical, only into free cells. The rest show in the hover detail.
-  const free = (y: number, x: number, n: number) =>
-    x + n <= width && Array.from({ length: n }, (_, i) => y * width + x + i).every(at => mask[at] === 0 && gmask[at] === 0 && !overlay.has(at))
-  const write = (y: number, x: number, text: string) => cells(text).forEach((c, i) => overlay.set(y * width + x + i, c))
+/**
+ * Edge labels go on after every line: centered on a bent hop's lane where it fits,
+ * else beside a vertical, only into free cells. The rest show in the hover detail.
+ * Only the hop leaving the source is labeled: a label further down a long edge lands
+ * beside whatever else runs there and reads as theirs.
+ */
+function labelEdges(grid: Grid, d: Diagram, g: Graph, routes: Route[]) {
   const firstHop = new Map<DiagramEdge, number>()
-  segs.forEach((s, k) => {
-    if (s.first) firstHop.set(s.edge, k)
+  g.hops.forEach((h, k) => {
+    if (h.first) firstHop.set(h.edge, k)
   })
   for (const e of d.edges) {
-    if (!e.label) continue
-    // Only the hop leaving the source: a label further down a long edge lands beside
-    // whatever else runs there and reads as theirs.
-    const chain = firstHop.has(e) ? [firstHop.get(e)!] : []
-    const tryPlace = () => {
-      for (const k of chain) {
-        const px = outPort[k]!, qx = inPort[k]!
-        const room = Math.abs(qx - px) - 1
-        const lw = textWidth(e.label!)
-        if (lane[k] !== -1 && room >= lw + 2) {
-          const x = Math.min(px, qx) + 1 + Math.floor((room - lw - 2) / 2)
-          const run = Array.from({ length: lw + 2 }, (_, i) => laneY(k) * width + x + i)
-          if (run.every(at => gmask[at] === 0 && !overlay.has(at))) {
-            write(laneY(k), x, ` ${e.label} `)
-            return
-          }
-        }
-        const text = ` ${clip(e.label!, 14)}`
-        const spots: [number, number][] = []
-        const turn = lane[k] === -1 ? bottom(k) : laneY(k)
-        for (let y = top(k); y < turn; y++) spots.push([y, px + 1])
-        for (let y = turn + 1; y < bottom(k); y++) spots.push([y, qx + 1])
-        // One free cell past the text, so it never touches another line.
-        const spot = spots.find(([y, x]) => free(y, x, textWidth(text) + 1))
-        if (spot) {
-          write(spot[0], spot[1], text)
-          return
-        }
+    const k = firstHop.get(e)
+    if (!e.label || k === undefined) continue
+    const { px, qx, top, bottom, laneY } = routes[k]!
+    const lw = textWidth(e.label)
+    const room = Math.abs(qx - px) - 1
+    if (laneY !== undefined && room >= lw + 2) {
+      const x = Math.min(px, qx) + 1 + Math.floor((room - lw - 2) / 2)
+      const run = Array.from({ length: lw + 2 }, (_, i) => cellAt(grid, x + i, laneY))
+      if (run.every(c => grid.borders[c] === 0 && !grid.text.has(c))) {
+        write(grid, x, laneY, ` ${e.label} `)
+        continue
       }
     }
-    tryPlace()
+    const text = ` ${clip(e.label, 14)}`
+    const turn = laneY ?? bottom
+    const spots: [number, number][] = []
+    for (let y = top; y < turn; y++) spots.push([px + 1, y])
+    for (let y = turn + 1; y < bottom; y++) spots.push([qx + 1, y])
+    // One free cell past the text, so it never touches another line.
+    const spot = spots.find(([x, y]) => isFree(grid, x, y, textWidth(text) + 1))
+    if (spot) write(grid, spot[0], spot[1], text)
   }
+}
 
+function toRows(grid: Grid): string[] {
   const rows: string[] = []
-  for (let y = 0; y < height; y++) {
+  for (let y = 0; y < grid.height; y++) {
     let line = ''
-    for (let x = 0; x < width; x++) {
-      const at = y * width + x
-      const e = mask[at]!, g = gmask[at]!
-      const crosses = (e & (U | D) && g & (L | R)) || (e & (L | R) && g & (U | D))
-      line += overlay.get(at) ?? (e !== 0 ? (crosses ? '┼' : GLYPH[e]) : GLYPH[g]) ?? ' '
+    for (let x = 0; x < grid.width; x++) {
+      const c = cellAt(grid, x, y)
+      const lineBits = grid.lines[c]!, borderBits = grid.borders[c]!
+      const crosses = (lineBits & (U | D) && borderBits & (L | R)) || (lineBits & (L | R) && borderBits & (U | D))
+      line += grid.text.get(c) ?? (lineBits !== 0 ? (crosses ? '┼' : GLYPH[lineBits]) : GLYPH[borderBits]) ?? ' '
     }
     rows.push(line.trimEnd())
   }
-  const boxes = items.flatMap((it, i) => (it.node ? [{ node: it.node, x: xs[i]!, y: rankY[it.rank]!, w: it.w, label: it.label, sub: it.sub }] : []))
 
-  return { width, height, boxes, groups, rows }
+  return rows
+}
+
+/**
+ * A layered (Sugiyama-style) layout in terminal cells: ranks top-down, edges
+ * that skip ranks broken into waypoints, ranks ordered by barycenter sweeps
+ * keeping the order with the fewest crossings, x pulled toward neighbors, and
+ * every hop routed orthogonally through the gap below its rank.
+ */
+export function layout(d: Diagram): Layout {
+  if (d.nodes.length === 0) return { width: 0, height: 0, boxes: [], groups: [], rows: [] }
+  const g = build(d)
+  const { layers, posOf } = orderRanks(g)
+  const blocks = blockGroups(g, layers, posOf)
+  const { xs, gx, gw, width } = placeX(g, blocks)
+  const ports = routePorts(g, xs)
+  const { lane, gapH } = assignLanes(g, ports)
+  const { rankY, height, groupEnds } = placeY(g, blocks, gapH)
+
+  const groups: GroupRect[] = blocks.runs.map(run => {
+    const [a, b] = blocks.span.get(run)!
+    const y = rankY[a]! - 2
+    return { name: groupName(run), x: gx.get(run)!, y, w: gw.get(run)!, h: rankY[b]! + BOX_H + 2 - y }
+  })
+  const routes: Route[] = g.hops.map((h, k) => {
+    const above = g.items[h.a]!.rank
+    const top = rankY[above]! + BOX_H
+    const laneY = lane[k] === -1 ? undefined : top + 1 + (groupEnds[above] ? 1 : 0) + lane[k]!
+    return { px: ports.outPort[k]!, qx: ports.inPort[k]!, top, bottom: rankY[g.items[h.b]!.rank]! - 1, laneY }
+  })
+
+  const grid: Grid = { width, height, lines: new Uint8Array(width * height), borders: new Uint8Array(width * height), text: new Map() }
+  drawHops(grid, g, routes, xs, rankY)
+  drawGroups(grid, groups)
+  labelEdges(grid, d, g, routes)
+  const boxes = g.items.flatMap((item, it) =>
+    item.node ? [{ node: item.node, x: xs[it]!, y: rankY[item.rank]!, w: item.w, label: item.label, sub: item.sub }] : [],
+  )
+
+  return { width, height, boxes, groups, rows: toRows(grid) }
 }
 
 // ---- review -----------------------------------------------------------------
 
 // A docked pane is rarely wider than this; past it the person has to pan.
-export const PANE_BUDGET = 100
+const PANE_BUDGET = 100
 
 /**
  * What the model reads after it draws: the laid-out size and what makes it hard

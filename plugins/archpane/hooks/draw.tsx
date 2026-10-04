@@ -1,5 +1,7 @@
 import type { ClientElements } from 'claude-code'
 
+import type { Status } from '../types'
+
 import { BOX_H, cells, textWidth, type Layout } from './lib'
 
 /** A laid-out diagram as plain data: what the pane hands its Client to draw. */
@@ -11,7 +13,7 @@ export type Drawing = {
   groups: { name: string; x: number; y: number; w: number; h: number }[]
 }
 
-export const toDrawing = (l: Layout, color: (status?: string) => string | undefined): Drawing => ({
+export const toDrawing = (l: Layout, color: (status?: Status) => string | undefined): Drawing => ({
   width: l.width,
   height: l.height,
   rows: l.rows,
@@ -27,12 +29,20 @@ export const toDrawing = (l: Layout, color: (status?: string) => string | undefi
   }),
 })
 
-// What each cell is: an edge cell, a group border, the menu's border or item `i`
-// (MENU_ITEM - i), or part of box `i` (its border, label row or sub row).
+// What owns each painted cell, as one number: an edge line, a group border, the menu's
+// border, menu item `i`, or one part of box `i`. Built and read only through the helpers.
 const EDGE = -1
 const GROUP = -2
 const MENU = -3
 const MENU_ITEM = -10
+const BORDER = 0, LABEL = 1, SUB = 2
+type Part = typeof BORDER | typeof LABEL | typeof SUB
+const boxCell = (box: number, part: Part) => box * 3 + part
+const boxOf = (cell: number) => Math.floor(cell / 3)
+const partOf = (cell: number) => cell % 3
+const menuCell = (item: number) => MENU_ITEM - item
+const menuItemOf = (cell: number) => MENU_ITEM - cell
+const isMenuItem = (cell: number) => cell <= MENU_ITEM
 
 /** A box's right-click menu, at diagram cell (x, y): its top-left corner. */
 export type Menu = { x: number; y: number; items: string[] }
@@ -40,18 +50,23 @@ export const menuSize = (items: string[]) => ({ w: Math.max(...items.map(textWid
 
 // A line of cells: the text, padded with spaces to `n` cells.
 const pad = (text: string, n: number) => [...cells(text), ...new Array<string>(Math.max(0, n - textWidth(text))).fill(' ')]
-const BORDER = 0, LABEL = 1, SUB = 2
-const cellOf = (box: number, part: number) => box * 3 + part
+/** `w` cells wide: a rounded border around one row per text. */
+const frame = (w: number, texts: string[]) => [
+  ['╭', ...pad('', w - 2).fill('─'), '╮'],
+  ...texts.map(t => ['│', ' ', ...pad(t, w - 4), ' ', '│']),
+  ['╰', ...pad('', w - 2).fill('─'), '╯'],
+]
 
 /** Paints the boxes over the edge rows, and a menu over those: every cell's glyph and owner. */
-export function paint(d: Drawing, menu?: Menu): { chars: string[][]; owner: number[][] } {
+function paint(d: Drawing, menu?: Menu): { chars: string[][]; owner: number[][] } {
   // A menu may reach past a small diagram: the grid grows to hold it.
   const { w: mw, h: mh } = menu ? menuSize(menu.items) : { w: 0, h: 0 }
   const W = Math.max(d.width, menu ? menu.x + mw : 0)
   const H = Math.max(d.height, menu ? menu.y + mh : 0)
   const chars = Array.from({ length: H }, (_, y) => pad(d.rows[y] ?? '', W))
   const owner = Array.from({ length: H }, () => new Array<number>(W).fill(EDGE))
-  // `?? []`: after a hot reload the canvas can still hold a drawing made before groups existed.
+  // `?? []`: after a hot reload the canvas can still hold a drawing made before groups
+  // existed; drop it once no running session can predate them.
   for (const g of d.groups ?? []) {
     for (let y = g.y; y < g.y + g.h; y++) {
       for (let x = g.x; x < g.x + g.w; x++) {
@@ -60,33 +75,22 @@ export function paint(d: Drawing, menu?: Menu): { chars: string[][]; owner: numb
     }
   }
   d.boxes.forEach((b, i) => {
-    const lines = [
-      ['╭', ...pad('', b.w - 2).fill('─'), '╮'],
-      ['│', ' ', ...pad(b.label, b.w - 4), ' ', '│'],
-      ['│', ' ', ...pad(b.sub, b.w - 4), ' ', '│'],
-      ['╰', ...pad('', b.w - 2).fill('─'), '╯'],
-    ]
-    for (let dy = 0; dy < BOX_H; dy++) {
-      lines[dy]!.forEach((c, dx) => {
+    frame(b.w, [b.label, b.sub]).forEach((line, dy) => {
+      line.forEach((c, dx) => {
         const edge = dy === 0 || dy === BOX_H - 1 || dx === 0 || dx === b.w - 1
         chars[b.y + dy]![b.x + dx] = c
-        owner[b.y + dy]![b.x + dx] = cellOf(i, edge ? BORDER : dy === 1 ? LABEL : SUB)
+        owner[b.y + dy]![b.x + dx] = boxCell(i, edge ? BORDER : dy === 1 ? LABEL : SUB)
       })
-    }
+    })
   })
 
   if (menu) {
-    const lines = [
-      ['╭', ...pad('', mw - 2).fill('─'), '╮'],
-      ...menu.items.map(i => ['│', ' ', ...pad(i, mw - 4), ' ', '│']),
-      ['╰', ...pad('', mw - 2).fill('─'), '╯'],
-    ]
-    lines.forEach((line, dy) => {
+    frame(mw, menu.items).forEach((line, dy) => {
       line.forEach((c, dx) => {
         const y = menu.y + dy, x = menu.x + dx
         chars[y]![x] = c
         const inside = dy > 0 && dy < mh - 1 && dx > 0 && dx < mw - 1
-        owner[y]![x] = inside ? MENU_ITEM - (dy - 1) : MENU
+        owner[y]![x] = inside ? menuCell(dy - 1) : MENU
       })
     })
   }
@@ -97,11 +101,6 @@ export function paint(d: Drawing, menu?: Menu): { chars: string[][]; owner: numb
 /** The painted diagram as plain lines, for tests and debugging. */
 export const screen = (d: Drawing) => paint(d).chars.map(r => r.join('').trimEnd())
 
-/**
- * The diagram as rows of sibling Text runs, cut to columns `panX`..`panX+cols`
- * by slicing, not by the surface's clipping. Every run of a box joins its hover
- * group (a Text nested in a Text could not heat it); the `picked` box is cyan.
- */
 /** One row's runs inside the window: consecutive cells with one owner, as drawn. */
 function runsOf(chars: string[][], owner: number[][], y: number, panX: number, end: number) {
   const line = chars[y]!
@@ -160,17 +159,17 @@ export function draw(
       if (who === EDGE) return <Text dimColor>{text}</Text>
       if (who === GROUP) return <Text color="blue">{text}</Text>
       if (who === MENU) return <Text color="cyan">{text}</Text>
-      if (who <= MENU_ITEM) {
+      if (isMenuItem(who)) {
         return (
-          <Text bold hover={{ scope: `menu:${MENU_ITEM - who}`, inverse: true }}>
+          <Text bold hover={{ scope: `menu:${menuItemOf(who)}`, inverse: true }}>
             {text}
           </Text>
         )
       }
-      const b = d.boxes[Math.floor(who / 3)]!
+      const b = d.boxes[boxOf(who)]!
       const scope = `n:${b.id}`
       const isPicked = b.id === picked
-      const part = who % 3
+      const part = partOf(who)
       if (part === BORDER) {
         const color = isPicked ? 'cyan' : b.color
         return (
